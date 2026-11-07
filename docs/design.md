@@ -28,7 +28,7 @@ AIMeter 前端 ──► AIMeter 后端 ─────────────�
                │  ├─ 登录/鉴权
                │  ├─ 余额/用量查询（封装 LiteLLM API）
                │  ├─ 充值 / 账本
-               │  └─ 对账与封禁任务
+               │  └─ 对账与停服任务
                ▼
             AIMeter DB（账本、充值订单、月度快照）
 ```
@@ -52,7 +52,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 | **余额** | `max_budget − spend` = 套餐剩余额度 + 钱包余额 |
 | 套餐额度 | 每月发放，月底作废；通过重算 `max_budget` 体现 |
 | 钱包余额（充值） | 不过期、滚存；充值即钱包增加，同时 `max_budget += 充值额`（`/user/update`） |
-| 欠费停服 | `spend >= max_budget` 时 LiteLLM 自动拒绝；另有 `blocked` 主动封禁 |
+| 欠费/手动停服 | `spend >= max_budget` 时 LiteLLM 自动拒绝；主动停服也通过预算实现（把 `max_budget` 设为当前 `spend`）。**不使用用户级 `blocked`**：规范中标注 `[Not Implemented Yet]`，且 `/v2/user/info` 不返回该字段 |
 
 约束：**不使用 LiteLLM 的 `budget_duration` 自动重置，也不重置 `spend`。** 原因：`budget_duration` 到期会把 `spend` 清零、额度重新发放，无法表达"套餐额度作废、钱包余额滚存"这两种不同生命周期的额度。改为由 AIMeter 每月滚动重算 `max_budget`，LiteLLM 的 `spend` 保持终身累加，边界误差只会在相邻月份之间转移，不会丢失（详见 4.8）。
 
@@ -67,32 +67,46 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 
 ### 4.2 余额查询
 - 后端调 `GET /v2/user/info?user_id=...`，取 `spend`、`max_budget`。
-- 返回：`balance = max(max_budget − spend, 0)`，并附 `blocked` 状态；同时按当期周期记录拆分为**套餐剩余额度**与**钱包余额**（见 4.8）。
-- 后端做 10–30 秒短缓存，防止前端刷新造成对 LiteLLM 的压力。
+- 返回：`balance = max(limit − spend, 0)`（`limit` 见 4.8），并给出服务状态 `in_service = (max_budget − spend > 0)`（不依赖 `blocked`）；同时按当期周期记录拆分为**套餐剩余额度** `max(0, plan_quota − (spend − spend_start))` 与**钱包余额** `balance − 套餐剩余额度`（见 4.8）。可用余额 = `max(balance − safety_reserve, 0)`（见 4.4）。
+- 后端做 10–30 秒短缓存，防止前端刷新造成对 LiteLLM 的压力；**充值、标记已付、周期滚动、停服/恢复后立即失效缓存**。
 
 ### 4.3 月度用量
 - 后端调 `GET /user/daily/activity?user_id=&start_date=&end_date=&timezone=`，返回按日的 `spend`、tokens、`api_requests`，并含 model/provider/api_key 拆分。
-- 后端按用户所属时区**按月聚合**。
+- **`timezone` 是整数分钟偏移，不是时区名**（规范原文：Timezone offset in minutes from UTC，沿用 JavaScript `Date.getTimezoneOffset()` 约定，符号相反：UTC+8 传 `-480`）；`start_date`/`end_date` 为 `YYYY-MM-DD` 字符串。
+- 月度聚合统一使用**结算时区**（见 4.8，所有用户相同，不使用无夏令时的固定偏移以外的时区），由后端自行计算月边界后传 `start_date`/`end_date` 与对应偏移；不做按用户时区的聚合。
+- **口径**：展示用 daily activity；计费结算用 `billing_cycles` 中记录的 `spend` 差值（4.8）。两者在边界上可能有微小差异（规范说明 daily 累计可能大于 `spend`），以 `billing_cycles` 为计费准，界面注明用量统计为参考口径。
 - 重要：必须使用 daily activity，**不能用 `spend` 当月账单**。官方说明 daily activity 只增不减、不受预算重置影响。
 - 已结束的月份固化到 AIMeter DB（`monthly_usage`），避免反复拉取，也防止上游数据保留策略变化。
 - 分页：注意 `page`/`page_size` 参数，聚合时需循环取完。
 
-### 4.4 余额耗尽停服（两层保障）
-1. **自动层（LiteLLM 原生）**：`spend >= max_budget` 即拒绝请求。这是主防线，无需 AIMeter 介入。
-2. **主动层（AIMeter 对账任务）**：
-   - 定时（如每分钟）扫描 `GET /user/list` 或按活跃用户查询，余额 ≤ 0 的用户调 `POST /user/update {blocked:true}`，同时写入审计日志。
-   - 充值成功后：增加 `max_budget`，若 `blocked=true` 则解封。
-   - 目的：处理并发超支、预算字段被意外改动、以及需要给用户发"欠费通知"的场景。
-3. **预警**：余额低于阈值（如 20%）通过邮件通知（v1 可选）。
+### 4.4 余额耗尽停服（不允许透支）
+
+**政策**：不允许用户余额为负，也不向用户追欠款。**停服统一通过预算实现，不使用用户级 `blocked`。**
+
+**停服/恢复的定义**
+- 停服态：把用户 `max_budget` 设为不高于当前 `spend`（取读取到的实时 `spend`），LiteLLM 因 `spend >= max_budget` 拒绝请求。边界判定（`>=` 还是 `>`）在 M0 验证。
+- 恢复：按 4.8 公式重算 `max_budget` 并写入，无需"解封"。
+- 手动停服（`/admin/users/{id}/hold`）：置 `users.manual_hold = true`，重算时始终写停服态；解除后恢复重算。
+
+**三层保障**
+1. **自动层（LiteLLM 原生）**：`spend >= max_budget` 即拒绝请求，主防线，无需 AIMeter 介入。
+2. **主动层（AIMeter 对账任务）**：定时（如每分钟）分页扫描 `GET /user/list`（含 `spend`、`max_budget`），对每个用户按周期记录和实时 `spend` 计算剩余额度；剩余 ≤ 0、`manual_hold`、或 `spend < spend_start`（见 4.8 异常处理）时写停服态，并写审计、发通知；剩余 > 0 但处于停服态时（例如充值后）重算恢复。目的：处理预算字段被意外改动、并发超支后的收敛、欠费通知。
+3. **防透支（尽量压低，非绝对）**：LiteLLM 在请求**完成后**才记账，并发请求可能小幅越过上限，仅靠预算无法做到绝对零透支。措施：
+   - `safety_reserve`：下发给 LiteLLM 的 `max_budget = limit − safety_reserve`，把保留额留给在途请求，使并发超支落在真实余额之内；界面显示"可用余额 = 余额 − safety_reserve"。保留额大小见第 11 节。
+   - 限制 `max_parallel_requests`、`rpm_limit`、`tpm_limit`，缩小并发窗口。
+   - 若仍超出（`U` 大于 套餐额度 + 钱包 + 充值），**不向用户追缴、钱包不记负数**：超出部分计入 `billing_cycles.overdraft`，由平台承担，触发告警，作为调整 `safety_reserve`/限流的依据。
+   - 更严格的实时校验（pre-call 钩子，在请求前按 AIMeter 余额拒绝）作为 v2 可选加固。
+
+**预警**：可用余额低于阈值（如 20%）通过邮件通知（v1 可选）。
 
 ### 4.5 充值
 - v1：管理员后台手动充值（`POST /admin/users/{id}/topup`）。
-- 流程：写入充值账本（幂等，带 `order_id`）→ 调 LiteLLM 增加 `max_budget` → 如被封禁则解封。
+- 流程：写入充值账本（幂等，带 `order_id`）→ 在用户锁内（见 4.8）确定所属周期并重算 `max_budget` 写入 LiteLLM（同时即恢复服务）。
 - **幂等与一致性**：先写本地账本（状态 pending）→ 调 LiteLLM → 标记 applied；失败可由重试任务补偿。禁止"读后写"式累加：`max_budget` 一律由当期周期记录重算（`spend_start + 套餐额度 + 钱包起始余额 + 当期充值合计`，见 4.8），保证重试安全。充值进入钱包，不过期。
 - v2：接入 Stripe 等，回调验签后走同一流程。
 
 ### 4.6 自服务界面
-- 概览：总余额，拆分显示套餐剩余额度（含到期日）与钱包余额；本月已用；套餐状态与下次扣费；封禁状态。
+- 概览：总余额，拆分显示套餐剩余额度（含到期日）与钱包余额；本月已用；套餐状态与下次扣费；服务状态（正常/已停服）。
 - 用量：月度柱状图 + 按模型拆分表，可切换月份。
 - Key 管理：查看 key 后四位、新建/轮换/删除 key（`/key/generate`、`/key/update`，只允许操作自己的）。
 - 充值记录：账本列表。
@@ -124,7 +138,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 
 **角色**
 - `users.role`：`user` / `admin`。管理接口（`/admin/*`）要求 `admin`，与普通用户使用同一登录体系但独立授权。
-- 被封禁（`blocked`）或停用的用户：欠费封禁**只影响 LiteLLM 模型调用**，不影响登录，用户仍能登录查看账单并充值；仅账户 `disabled` 时禁止登录。
+- 被停服（余额耗尽或手动停服）或停用的用户：停服**只影响 LiteLLM 模型调用**，不影响登录，用户仍能登录查看账单并充值；仅账户 `disabled` 时禁止登录。
 
 **接口**见第 5 节认证部分。
 
@@ -144,23 +158,30 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 
 ```
 周期开始：
-  spend_start = 当前 LiteLLM spend
-  max_budget  = spend_start + plan_quota + wallet_start        -- 套餐已支付，否则 plan_quota=0
+  spend_start = 上一周期的 spend_end（首个周期：开户时读取的 LiteLLM spend）
+  limit       = spend_start + plan_quota + wallet_start + topups_total   -- 套餐未付则 plan_quota=0
+  max_budget  = limit − safety_reserve                                   -- 见 4.4；停服态则取实时 spend
 
-周期内：
-  用户充值 T：   wallet += T；max_budget += T
-  支付套餐费：   plan_quota 发放；max_budget += quota（周期内晚付时）
-  余额 = max_budget − spend = 套餐剩余 + 钱包余额
+周期内（每次变更都重算，不做增量累加）：
+  充值 T：      topups_total += T，重算 limit / max_budget
+  支付套餐费：  plan_quota 发放，重算（周期内晚付时）
+  余额 = limit − spend = 套餐剩余 + 钱包余额
 
 周期结束结算：
-  spend_end   = 当前 LiteLLM spend
+  spend_end   = 结算时读取的 LiteLLM spend（写入周期记录后不再改）
   U           = spend_end − spend_start                        -- 当月用量
   from_plan   = min(U, plan_quota)
   from_wallet = U − from_plan
-  wallet_end  = max(0, wallet_start + 当期充值合计 − from_wallet)
-  overdraft   = max(0, from_wallet − (wallet_start + 当期充值合计))   -- 并发超支，记录备查
+  wallet_end  = max(0, wallet_start + topups_total − from_wallet)
+  overdraft   = max(0, from_wallet − (wallet_start + topups_total))   -- 并发超支：平台承担，不追缴，记录并告警（见 4.4）
   下一周期：spend_start' = spend_end，wallet_start' = wallet_end
 ```
+
+**基线说明**：`spend_end` 是唯一权威基线。写入新 `max_budget` 之前若有请求在途或任务失败重试，实时 `spend` 会略大于 `spend_end`，这部分差额因 `spend_start' = spend_end` 自然计入**新周期**消耗，不会丢失，也不需要额外补偿。
+
+**异常处理（防 `spend` 被改动）**：每次重算 `max_budget` 前读取实时 `spend`，若 `spend < spend_start`（被重置或手动编辑），**停止重算、写停服态、告警**，由管理员处理后再恢复（宁可停服也不下发错误的额度）。开户时显式传 `budget_duration` 为空，且不设置会产生周期重置的默认用户参数。
+
+**按用户串行化**：充值应用、标记已付、月度结算、对账任务对同一用户写 LiteLLM 前必须获取该用户的锁（数据库行锁或 advisory lock）。`topups.cycle_month` 在**应用时**（锁内）确定，取当时的开启周期；对已关闭周期的套餐费账单，付款后**不发放套餐额度**，金额按管理员确认转入钱包（默认策略，见第 11 节）。
 
 套餐额度"作废"无需任何额外动作：下个周期重算 `max_budget` 时不再包含上月未用的部分。
 
@@ -172,8 +193,8 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 **每月任务（幂等）**
 1. 在周期边界执行；以 `billing_cycles (user_id, month)` 为幂等键，重复执行不重复结算。
 2. 结算：读取 `spend_end` 并**一次性写入**周期记录，之后只用该记录计算。
-3. 开启新周期：写入新记录，生成套餐费账单（`auto_renew` 的订阅），调 `/user/update` 设置新 `max_budget`，必要时解封。
-4. 任务延迟窗口内，套餐额度已耗尽的用户会维持被拒状态，直到新上限写入；任务应在周期边界后立即运行，并监控其执行。
+3. 开启新周期：写入新记录，生成套餐费账单（`auto_renew` 的订阅），调 `/user/update` 设置新 `max_budget`（即恢复服务）；写入后回读 `/v2/user/info` 校验 `max_budget`，不一致则重试并告警。
+4. **任务延迟的两面影响**：窗口内上月套餐额度已耗尽的用户继续被拒；反之，上月额度有剩余的用户会在窗口内继续用到"已过期"的额度（`max_budget` 仍是上月值，且这部分用量按旧周期结算，消耗的是旧额度）。该损失以窗口内的用量为上界，v1 接受。任务应在周期边界后立即运行，记录 `closed_at` 并监控延迟（超过阈值如 5 分钟告警）。
 
 **套餐费未支付**
 - 订阅状态 `past_due`：该周期 `plan_quota = 0`，用户仍可凭钱包余额使用；支付后立即发放当期额度。
@@ -206,7 +227,7 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | POST | `/admin/invoices/{id}/mark-paid` | 确认套餐费已付，发放当期额度 |
 | POST | `/admin/users` | 开户 |
 | POST | `/admin/users/{id}/topup` | 手动充值 |
-| POST | `/admin/users/{id}/block` / `unblock` | 手动封禁/解封 |
+| POST | `/admin/users/{id}/hold` / `unhold` | 手动停服/解除（`manual_hold`，通过预算实现，见 4.4） |
 
 所有 `/api/me/*` 的 `user_id` 取自登录会话，**永不接受客户端传入**，防止越权。
 
@@ -215,7 +236,7 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | 用途 | 接口 |
 |---|---|
 | 开户 | `POST /user/new` |
-| 修改额度/封禁 | `POST /user/update`（`max_budget`、`blocked`） |
+| 修改额度/停服 | `POST /user/update`（`max_budget`；停服即把 `max_budget` 设为不高于当前 `spend`）。不使用 `blocked`（规范标注未实现） |
 | 查余额 | `GET /v2/user/info` |
 | 批量扫描 | `GET /user/list` |
 | 月度/日度用量 | `GET /user/daily/activity` |
@@ -230,11 +251,11 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 ```
 users(id  -- 同时作为 LiteLLM user_id,
       email UNIQUE, password_hash, role[user|admin],
-      status[invited|active|disabled], failed_logins, locked_until, created_at)
+      status[invited|active|disabled], manual_hold, failed_logins, locked_until, created_at)
 sessions(id_hash PK, user_id, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at)
 auth_tokens(token_hash PK, user_id, purpose[invite|reset|email_change], expires_at, used_at)
 topups(id, user_id, order_id UNIQUE, amount, currency, status[pending|applied|failed],
-       source[manual|stripe], created_at, applied_at)
+       source[manual|stripe], cycle_month  -- 应用时在用户锁内确定, created_at, applied_at)
 monthly_usage(user_id, month, spend, prompt_tokens, completion_tokens,
               requests, breakdown_json, finalized_at,  PRIMARY KEY(user_id, month))
 audit_log(id, actor, action, target_user, detail_json, created_at)
@@ -242,7 +263,7 @@ plans(id, name, monthly_fee, monthly_quota, currency, active)
 subscriptions(user_id PK, plan_id, status[active|past_due|canceled], auto_renew, started_at)
 invoices(id, user_id, cycle_month, kind[plan_fee], amount, status[pending|paid|void], created_at, paid_at)
 billing_cycles(user_id, month, spend_start, spend_end, plan_quota, wallet_start, topups_total,
-               wallet_end, overdraft, status[open|closed], PRIMARY KEY(user_id, month))
+               wallet_end, overdraft, status[open|closed], closed_at, PRIMARY KEY(user_id, month))
 ```
 
 （`topups` 即钱包充值；`applied` 的充值记入当期 `topups_total`。）
@@ -295,12 +316,13 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 | 风险 | 说明 | 应对 |
 |---|---|---|
-| 并发超支 | spend 在请求完成后记账，高并发会小幅超出 `max_budget` | 加 `rpm_limit`/`max_parallel_requests`；对账任务及时封禁；业务上接受小额透支 |
+| 并发超支 | spend 在请求完成后记账，高并发会小幅超出 `max_budget`，无法做到绝对零透支 | `safety_reserve` + 并发/速率限制；对账任务收敛；残余超支由平台承担、记 `overdraft` 并告警（见 4.4）；v2 可加 pre-call 钩子 |
+| 用户级 `blocked` 未实现 | 规范标注 `[Not Implemented Yet]`，且 `/v2/user/info` 不返回 | 不使用；停服统一用 `max_budget ≤ spend`；M0 验证边界判定 |
 | BETA 接口变动 | `daily/activity` 标注 BETA | 锁定 LiteLLM 版本；封装适配层；升级前跑契约测试 |
 | 企业版限制 | 部分报表/SSO 可能需 Enterprise 许可 | 实现前逐项核对许可证；核心路径只用开源接口 |
 | 用户级预算对多 key 的行为 | 需确认用户 `max_budget` 是否约束其所有 key | **实现第一步在测试实例验证** |
 | `/v2/user/info` 返回字段 | 本文未核对响应字段细节 | 对照实际响应落地 DTO |
-| 时区与月边界 | 月度汇总依赖时区 | 统一使用用户时区，`timezone` 参数传入，并固化已结束月份；套餐周期使用统一结算时区 |
+| 时区与月边界 | `/user/daily/activity` 的 `timezone` 是整数分钟偏移（符号同 `getTimezoneOffset`），无法表达夏令时 | 统一结算时区（建议无夏令时的固定偏移）；自行计算月边界；固化已结束月份；套餐周期用同一时区 |
 | 月度滚动任务失败/延迟 | 任务未执行时，新周期的 `max_budget` 未更新，套餐耗尽的用户会继续被拒 | 任务幂等、边界后立即运行、失败告警；可手动重跑 |
 | 结算读取 `spend` 的边界误差 | 在途请求的费用落入下一周期 | `spend` 不重置，总额不丢，仅月度归属微小偏移；接受并在文档中说明 |
 | 预算变更传播延迟 | 多实例且无 Redis 时，其他实例最多约 60 秒仍按旧预算拦截（来自 LiteLLM 自助文档，待验证） | 部署 Redis；充值/新周期后在界面提示可能有短暂延迟 |
@@ -308,7 +330,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 ## 10. 里程碑
 
-1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构、`blocked` 行为；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟。
+1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟。
 2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户、余额、月度用量、手动充值（钱包）、账本、对账封禁任务。
 3. **M1.5 月度套餐**：套餐与订阅、套餐费账单（手动标记已付）、周期记录与每月滚动重算任务、余额拆分（套餐/钱包）。
 4. **M2 AIMeter 前端（用户自服务界面）**：概览（套餐/钱包拆分）、用量图、key 管理、充值记录、套餐与账单。
@@ -320,5 +342,21 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 - 技术栈（建议：后端 FastAPI + PostgreSQL，前端 React/Vue 任选；尚未确认）。
 - ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）。仍待定：是否开放自助注册（含邮箱验证）；SMTP/邮件发送服务选型；后续是否追加 OIDC 登录。
 - 余额单位（美元计价 vs 自定义"点数"；LiteLLM 内部以 USD 记账，点数需在 AIMeter 层换算）。
-- 是否允许小额透支。
+- ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。仍待定：`safety_reserve` 的大小；`max_parallel_requests`/`rpm_limit` 默认值。
+- 已关闭周期的套餐费账单被付款后的处理：默认转入钱包，不发放套餐额度，需确认。
 - 套餐细节：套餐档位与价格；`quota` 是否等于 `fee`（是否赠送额外额度）；周期统一结算时区（UTC / Asia/Shanghai）；用户月中开通或升降级是否按比例折算；套餐费未付时是否设宽限期。
+
+## 12. 评审待办（尚未处理）
+
+来自一次独立评审，以下问题已确认但尚未写入正文设计：
+
+- 开户（4.1）需同时创建当期 `billing_cycles` 记录，并处理月中开通的折算；否则"`max_budget` 始终由周期行推导"不成立。
+- 取消订阅：缺取消接口，未定义当期已付额度与待付账单（应 `void`）的处理，以及是否退款。
+- 金额类型：LiteLLM 预算为 USD 浮点，`plans.currency` 与之的换算未定义；数据库使用 Decimal，推送时统一舍入。
+- 用户权限（M5）：`internal_user` 可通过数据面端口调用 `/key/*` 自建带预算的 key，需在网关限制路由或用 `allowed_routes`；`/key/regenerate` 规范中存在，应补入 key 轮换与 API 表。
+- `billing_cycles` 增加同步状态字段（`synced_at`、最后下发的 `max_budget`、`plan_paid_at`、套餐费快照、任务 run id）；`/user/new` 与 `/key/generate` 中途失败的补偿。
+- 钱包充值缺冲正/退款状态（Stripe 拒付）。
+- API 表缺：取消订阅、查看订阅、邀请重发、改邮箱、邮箱验证、会话列表、管理员账单列表。
+- 安全：`DELETE /api/me/keys/{id}` 的归属校验（IDOR）与 key 数量上限；管理员充值/标记已付需二次验证；登录锁定可被用于恶意锁号；`audit_log` 与 `topups`/`invoices`/`billing_cycles` 的关联。
+- 里程碑：`billing_cycles` 应在 M1 建好（4.5 的充值依赖它）。
+- 风险表中 `max_internal_user_budget` 周期的表述在规范中无法核实，需重新措辞。
