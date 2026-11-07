@@ -39,6 +39,7 @@ AIMeter 前端 ──► AIMeter 后端 ─────────────�
 - **数据面与管理面分离**：用户调用模型直连 LiteLLM（用自己的 key）；查询余额/用量只走 AIMeter 后端。
 - **master key 只存在于后端**，前端和用户永远拿不到。
 - **LiteLLM 是消费数据的事实来源，AIMeter 账本是充值数据的事实来源。**
+- **只管理自己创建的用户**：AIMeter 只处理 `users` 表中的用户（其 `id` 即 LiteLLM `user_id`）。LiteLLM 中的其他用户（包括其他 `internal_user`）不在管理范围：不读取其花费、不修改其预算、不为其计费或停服。开户时若 `user_id` 与 LiteLLM 已有用户冲突，开户失败，不接管已有用户。
 
 ### 2.1 技术栈
 
@@ -123,7 +124,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 
 **三层保障**
 1. **自动层（LiteLLM 原生）**：`spend >= max_budget` 即拒绝请求，主防线，无需 AIMeter 介入。
-2. **主动层（AIMeter 对账任务）**：定时（如每分钟）分页扫描 `GET /user/list`（含 `spend`、`max_budget`），对每个用户按周期记录和实时 `spend` 计算剩余额度；未开通、剩余 ≤ `safety_reserve`、`manual_hold`、或 `spend < spend_start`（见 4.8 异常处理）时写停服态，并写审计、发通知；已开通且剩余 > `safety_reserve` 但处于停服态时（例如充值后）重算恢复。目的：处理预算字段被意外改动、并发超支后的收敛、欠费通知。
+2. **主动层（AIMeter 对账任务）**：定时（如每分钟）分页扫描 `GET /user/list`（含 `spend`、`max_budget`），**只处理 `users` 表中存在的用户，其余 LiteLLM 用户一律忽略、不修改**，对每个被管理用户按周期记录和实时 `spend` 计算剩余额度；未开通、剩余 ≤ `safety_reserve`、`manual_hold`、或 `spend < spend_start`（见 4.8 异常处理）时写停服态，并写审计、发通知；已开通且剩余 > `safety_reserve` 但处于停服态时（例如充值后）重算恢复。目的：处理预算字段被意外改动、并发超支后的收敛、欠费通知。
 3. **防透支（尽量压低，非绝对）**：LiteLLM 在请求**完成后**才记账，并发请求可能小幅越过上限，仅靠预算无法做到绝对零透支。措施：
    - **并发限制：每用户 `max_parallel_requests = 2`**。不单独设置 `max_tokens` 上限：单个请求的输出以各模型自身的最大输出 token（LiteLLM 模型元数据 `max_output_tokens`）为上界。
    - `safety_reserve = 并发上限 × 单个请求最坏成本`（并发 2 即 2 倍）。开放哪些模型以 LiteLLM 为准，最坏成本由 LiteLLM 的模型元数据自动计算（`GET /model_group/info`，见 4.9）：单个请求最坏成本 = `max_input_tokens × input_cost_per_token + max_output_tokens × output_cost_per_token`，取所有开放模型的最大值。下发给 LiteLLM 的 `max_budget = limit − safety_reserve`，把保留额留给在途请求，使并发超支落在真实余额之内。保留额仍在钱包里、月底只按实际用量结算，**不会损失**；界面显示"可用余额 = 余额 − safety_reserve"。
