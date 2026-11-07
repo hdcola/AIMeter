@@ -15,6 +15,7 @@
 ### 非目标（v1 不做）
 - 支付网关对接细节（仅预留充值入口与回调接口，v1 提供管理员手动充值）。
 - 正式发票开具、税务、多币种（v1 仅美元 USD，界面以 `$` 显示）。
+- API 令牌访问管理接口（v1 不开放；如有自动化需求，后续只考虑开放只读的管理接口，写操作保留给会话，见 4.7）。
 - 邮件发送（v1 不做）：提醒走站内通知；邀请开户与重置密码由管理员转交一次性链接；不开放自助注册。
 - 团队/组织级计费（v1 只做个人用户维度）。
 
@@ -168,6 +169,18 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 - `users.role`：`user` / `admin`。管理接口（`/admin/*`）要求 `admin`，与普通用户使用同一登录体系但独立授权。
 - 被停服（余额耗尽或手动停服）或停用的用户：停服**只影响 LiteLLM 模型调用**，不影响登录，用户仍能登录查看账单并充值；仅账户 `disabled` 时禁止登录。
 
+**API 令牌（程序/agent 调用）**
+
+浏览器用 Cookie 会话；脚本和 agent 调用 AIMeter 接口时，Cookie 会话不便（需模拟登录、保存 Cookie、处理 CSRF 与过期），因此另提供 API 令牌。注意：agent 调**模型**用的是 LiteLLM virtual key，直连 LiteLLM，与这里无关。
+
+- **格式与存储**：`aim_` 前缀 + 32 字节随机串（前缀便于密钥扫描工具识别）；明文仅在创建时显示一次，库中只存 SHA-256 哈希，并保存可展示的前缀；不透明令牌，不使用 JWT，吊销即时生效。
+- **使用**：`Authorization: Bearer aim_...`。令牌认证不走 CSRF（CSRF 仅针对 Cookie），但按令牌限流。
+- **权限范围**：v1 只有 `read`（只读）。可访问：`GET /api/me`、`/api/me/balance`、`/api/me/usage/*`、`/api/me/topups`、`/api/me/statements`、`/api/me/notifications`。**不可**访问：登录相关、修改密码、key 管理、令牌管理、任何写操作，以及**全部 `/admin/*`**（v1 不对令牌开放管理接口：管理接口涉及充值、重置链接、系统配置，令牌易泄露、无法二次验证，且 agent 有被提示词注入的风险）。令牌访问不允许的接口返回 403。
+- **创建与管理**：只能通过会话创建（令牌不能创建令牌），创建时需重新输入密码；每人最多 5 个有效令牌；必须命名，必须设置过期时间（默认 90 天，最长 1 年，不允许永不过期）；可随时吊销；记录最后使用时间与来源 IP。
+- **失效条件**：令牌过期或被吊销；所属账户被 `disabled`；管理员为该用户重置密码时吊销其全部令牌。欠费停服的用户令牌**仍可用**（只读，便于 agent 查看停服原因与所需充值额）。
+- **审计**：创建、吊销写入审计日志。
+- 管理员账户同样只能创建 `read` 令牌，且只能访问自己的 `/api/me/*`，不能访问 `/admin/*`。
+
 **接口**见第 5 节认证部分。
 
 ### 4.8 预付钱包与月底结算（最低月费）
@@ -295,6 +308,9 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | GET | `/api/me/topups` | 充值记录 |
 | GET | `/api/me/statements` | 月度账单：用量、最低月费、实际扣费、期末余额 |
 | GET | `/api/me/notifications` | 站内提醒（月底前提醒、下月停服通知） |
+| POST | `/api/me/tokens` | 创建 API 令牌（仅会话；需重新输入密码；明文只返回一次） |
+| GET | `/api/me/tokens` | 令牌列表（名称、前缀、范围、到期、最后使用） |
+| DELETE | `/api/me/tokens/{id}` | 吊销令牌 |
 | PUT | `/admin/users/{id}/min-fee` | 设置用户最低月费（空则用全局默认） |
 | POST | `/admin/users/{id}/reset-link` | 生成一次性重置密码链接，由管理员转交用户 |
 | GET | `/admin/config` | 读取系统配置（4.9） |
@@ -303,7 +319,9 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | POST | `/admin/users/{id}/topup` | 手动充值 |
 | POST | `/admin/users/{id}/hold` / `unhold` | 手动停服/解除（`manual_hold`，通过预算实现，见 4.4） |
 
-所有 `/api/me/*` 的 `user_id` 取自登录会话，**永不接受客户端传入**，防止越权。
+所有 `/api/me/*` 的 `user_id` 取自登录会话（或令牌所属用户），**永不接受客户端传入**，防止越权。
+
+**认证方式**：除 `/api/auth/*` 外，下列只读接口接受**会话或 API 令牌**：`GET /api/me`、`/api/me/balance`、`/api/me/usage/*`、`/api/me/topups`、`/api/me/statements`、`/api/me/notifications`。其余接口（改密码、key 管理、令牌管理）仅接受会话；全部 `/admin/*` 仅接受会话，不对令牌开放（见 4.7）。
 
 ## 6. LiteLLM 接口使用清单
 
@@ -330,6 +348,8 @@ users(id  -- 同时作为 LiteLLM user_id,
       failed_logins, locked_until, created_at)
 sessions(id_hash PK, user_id, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at)
 auth_tokens(token_hash PK, user_id, purpose[invite|reset], expires_at, used_at)
+api_tokens(id, user_id, name, token_hash UNIQUE, prefix, scopes[read], expires_at,
+           last_used_at, last_used_ip, created_at, revoked_at)
 topups(id, user_id, order_id UNIQUE, amount, currency, status[pending|applied|failed],
        source[manual|stripe], cycle_month  -- 应用时在用户锁内确定, created_at, applied_at)
 monthly_usage(user_id, month, spend, prompt_tokens, completion_tokens,
@@ -356,7 +376,8 @@ LiteLLM 的 `max_budget` 是账本的投影：始终由当期 `billing_cycles` �
 - master key 仅存于后端环境变量/密钥管理，不入库、不下发（详见 8.1）。
 - 后端到 LiteLLM 走内网；LiteLLM 管理接口不对公网暴露，仅公开数据面（`/v1/*`）。
 - 所有 `/api/me/*` 做会话鉴权 + 用户隔离；管理接口独立角色。认证细节见 4.7（argon2id、服务端会话、登录限流）。
-- 新建 key 明文只返回一次。
+- 新建 key 明文只返回一次；API 令牌同理，库中只存哈希。
+- API 令牌 v1 只读，不可访问 `/admin/*` 与任何写操作（见 4.7）。
 - 审计所有额度变更与停服动作。
 
 ### 8.1 Master key 说明与管理
