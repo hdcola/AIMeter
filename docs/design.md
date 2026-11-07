@@ -76,7 +76,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 
 | 业务概念 | LiteLLM 实现 |
 |---|---|
-| 用户 | Internal User（`/user/new`），`user_id` 与 AIMeter 用户一一对应 |
+| 用户 | LiteLLM 用户（`/user/new`），角色 `internal_user_viewer`（**只有使用权限，无管理权限**，见 4.1），`user_id` 与 AIMeter 用户一一对应 |
 | 用户登录凭据 | **不复用 LiteLLM**：邮箱密码由 AIMeter 自建（见 4.7），LiteLLM 侧不设 `password` |
 | 用户 API key | Virtual Key（`/key/generate`，绑定 `user_id`） |
 | 额度上限 | `max_budget`（用户级）。= 周期起始 `spend` + 钱包可用额度 − `safety_reserve`，由 AIMeter 重算并下发（见 4.8） |
@@ -95,8 +95,10 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 
 ### 4.1 开户
 1. AIMeter 创建用户记录（邮箱、角色、状态 `invited`），并生成一次性"设置密码"链接，由管理员转交用户（v1 不发邮件，见 4.7）。
-2. 调 `POST /user/new`：`user_id`（取 AIMeter `users.id`）、`user_email`、`user_role=internal_user`、`max_budget=0`（钱包为 0，尚未开通，处于停服态）、`budget_duration` 留空、`max_parallel_requests=2`（见 4.4）、`auto_create_key=false`；**不传 `password`**。
-3. 调 `POST /key/generate`：绑定 `user_id`，**key 自身不设 `max_budget`**（避免与用户余额双重限制不一致），返回给用户一次（之后只显示后四位）。
+2. 调 `POST /user/new`：`user_id`（取 AIMeter `users.id`）、`user_email`、`user_role=internal_user_viewer`、`max_budget=0`（钱包为 0，尚未开通，处于停服态）、`budget_duration` 留空、`max_parallel_requests=2`（见 4.4）、`auto_create_key=false`；**不传 `password`**。
+3. 调 `POST /key/generate`：绑定 `user_id`，**key 自身不设 `max_budget`**（避免与用户余额双重限制不一致），并用 `allowed_routes` 限制该 key 只能访问模型调用路由（取值待 M0 核实）；返回给用户一次（之后只显示后四位），同时把 key 的标识记入 `user_keys` 表（见第 7 节）。
+
+**权限原则**：AIMeter 创建的用户**只有使用权限，没有管理权限**。依据规范中的角色说明：`internal_user` 可以创建、删除自己的 key，`internal_user_viewer` 只能查看自己的 key 和花费；因此开户使用 `internal_user_viewer`。key 一律由 AIMeter 用 master key 代用户创建（4.6），用户不需要也不应当自己创建 key。该用户没有设置 LiteLLM 密码，无法登录其 `/ui`。以上行为（该角色的 key 能否正常调用模型、能否被拒绝调用 `/key/generate`）纳入 M0 验证。
 4. 创建首个 `billing_cycles` 记录（`spend_start` = 开户时读取的 LiteLLM `spend`，`wallet_start = 0`，未开通）。首次充值达到最低月费后开通服务（见 4.8）。
 
 ### 4.2 余额查询
@@ -134,6 +136,8 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 
 **预警**：月底前提醒见 4.8「月底前提醒」；另可在可用余额低于阈值（如 20%）时通知（可选）。
 
+**密钥核对（对账任务的一部分）**：用户不应有管理权限（4.1），正常情况下不会出现 AIMeter 之外创建的 key。作为检查，对账任务对每个被管理用户调用 `GET /key/list`（按 `user_id`），与 `user_keys` 比对；若发现**在 AIMeter 中不存在的 key**，写入一条 `unknown_key` 告警（`alerts` 表，见第 7 节），在管理员界面显示，**由管理员手工处理，系统不自动删除或封禁**。同一个 key 的告警只创建一次（按 key 标识去重）。其他类型的告警（`overdraft`、`spend` 回退等）也记入同一张表。
+
 ### 4.5 充值
 - v1：管理员后台手动充值（`POST /admin/users/{id}/topup`）。
 - 流程：写入充值账本（幂等，带 `order_id`）→ 在用户锁内（见 4.8）确定所属周期并重算 `max_budget` 写入 LiteLLM（同时即恢复服务）。
@@ -144,7 +148,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 - 概览：钱包余额与可用余额；本月已用；本月最低月费与**预计月底扣费**（`max(已用, 最低月费)`）；服务状态（正常/已停服，停服时给出原因：余额不足最低月费 / 余额耗尽 / 手动停服）。
 - 月度账单：每月用量、最低月费、实际扣费、期末余额。
 - 用量：月度柱状图 + 按模型拆分表，可切换月份。
-- Key 管理：查看 key 后四位、新建/轮换/删除 key（`/key/generate`、`/key/update`，只允许操作自己的）。
+- Key 管理：查看 key 后四位、新建/轮换/删除 key（由 AIMeter 用 master key 调 `/key/generate`、`/key/update`、`/key/delete` 代为操作，且只允许操作 `user_keys` 中属于自己的 key）。
 - 充值记录：账本列表。
 
 ### 4.7 用户认证（自建邮箱密码）
@@ -322,6 +326,8 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | POST | `/admin/users/{id}/reset-link` | 生成一次性重置密码链接，由管理员转交用户 |
 | GET | `/admin/config` | 读取系统配置（4.9） |
 | PUT | `/admin/config/{key}` | 修改系统配置项（写审计） |
+| GET | `/admin/alerts` | 查看对账告警（未知 key、超支、`spend` 回退等） |
+| POST | `/admin/alerts/{id}/resolve` | 标记告警已处理 |
 | POST | `/admin/users` | 开户 |
 | POST | `/admin/users/{id}/topup` | 手动充值 |
 | POST | `/admin/users/{id}/hold` / `unhold` | 手动停服/解除（`manual_hold`，通过预算实现，见 4.4） |
@@ -338,13 +344,14 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | 修改额度/停服 | `POST /user/update`（`max_budget`；停服即把 `max_budget` 设为不高于当前 `spend`）。不使用 `blocked`（规范标注未实现） |
 | 查余额 | `GET /v2/user/info` |
 | 批量扫描 | `GET /user/list` |
+| 密钥核对 | `GET /key/list`（按 `user_id`，M0 核实过滤参数与返回字段） |
 | 月度/日度用量 | `GET /user/daily/activity` |
 | 发/改/删 key | `POST /key/generate`、`/key/update`、`/key/delete` |
 | 明细对账（可选） | `GET /spend/logs` |
 | 模型列表与单价（计算 `safety_reserve`） | `GET /model_group/info` |
 | 终端客户模式（备选） | `/customer/new`、`/customer/block`、`/customer/daily/activity` |
 
-备选：若用户并不登录 LiteLLM、只通过请求里的 `user` 字段标识，可使用 Customer（End User）模型。本设计选 Internal User 是因为需要为每个用户发独立 key。
+备选：若用户并不登录 LiteLLM、只通过请求里的 `user` 字段标识，可使用 Customer（End User）模型。本设计选 LiteLLM 用户（角色 `internal_user_viewer`）是因为需要为每个用户发独立 key，且该角色没有创建 key 等管理权限。
 
 ## 7. 数据模型（AIMeter DB）
 
@@ -362,6 +369,10 @@ topups(id, user_id, order_id UNIQUE, amount, currency, status[pending|applied|fa
 monthly_usage(user_id, month, spend, prompt_tokens, completion_tokens,
               requests, breakdown_json, finalized_at,  PRIMARY KEY(user_id, month))
 audit_log(id, actor, action, target_user, detail_json, created_at)
+user_keys(id, user_id, litellm_key_ref  -- LiteLLM 返回的 key 标识（哈希/id，M0 核实）, key_alias,
+          created_at, revoked_at)
+alerts(id, type[unknown_key|overdraft|spend_regression|...], user_id, dedupe_key UNIQUE, detail_json,
+       status[open|resolved], created_at, resolved_at, resolved_by)
 billing_cycles(user_id, month, spend_start, spend_end, min_fee  -- 本周期快照,
                min_fee_cycle  -- 按天折算后的保底额,
                activated_at  -- 空=本周期未开通, wallet_start, topups_total,
@@ -427,6 +438,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 |---|---|---|
 | 并发超支 | spend 在请求完成后记账，高并发会小幅超出 `max_budget`，无法做到绝对零透支 | 每用户并发 2 + `safety_reserve`（按模型最大输入/输出计算）；对账任务收敛；残余超支由平台承担、记 `overdraft` 并告警（见 4.4）；v2 可加 pre-call 钩子 |
 | 用户级并发限制是否覆盖所有 key | `max_parallel_requests` 若只在 key 级生效，用户多发 key 即可绕过"并发 2"，保留额随之失效 | M0 验证用户级限制；若不生效，限制每用户 key 数量或改在网关层做限制 |
+| 出现 AIMeter 之外创建的 key | 若用户角色权限过大，可能自行创建 key 并绕开 AIMeter 的管理 | 用户使用 `internal_user_viewer`、key 限制路由（`allowed_routes`）；对账时用 `GET /key/list` 核对 `user_keys`，发现未知 key 告警并由管理员手工处理；M0 验证角色与路由限制是否如预期 |
 | 用户级 `blocked` 未实现 | 规范标注 `[Not Implemented Yet]`，且 `/v2/user/info` 不返回 | 不使用；停服统一用 `max_budget ≤ spend`；M0 验证边界判定 |
 | BETA 接口变动 | `daily/activity` 标注 BETA | 锁定 LiteLLM 版本；封装适配层；升级前跑契约测试 |
 | 企业版限制 | 部分报表/SSO 可能需 Enterprise 许可 | 实现前逐项核对许可证；核心路径只用开源接口 |
@@ -440,7 +452,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 ## 10. 里程碑
 
-1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟；验证用户级 `max_parallel_requests=2` 是否对该用户所有 key 生效；测量请求完成后 `spend` 的记账延迟（决定是否需要启用 `rpm_limit`/`tpm_limit`）；核对 `/model_group/info` 返回的 `max_input_tokens`/`max_output_tokens`/单价与实际开放模型一致，并估算 `safety_reserve` 的实际金额是否可接受；核实 LiteLLM `spend`/模型单价的币种（预期为 USD）。
+1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟；验证用户级 `max_parallel_requests=2` 是否对该用户所有 key 生效；测量请求完成后 `spend` 的记账延迟（决定是否需要启用 `rpm_limit`/`tpm_limit`）；核对 `/model_group/info` 返回的 `max_input_tokens`/`max_output_tokens`/单价与实际开放模型一致，并估算 `safety_reserve` 的实际金额是否可接受；核实 LiteLLM `spend`/模型单价的币种（预期为 USD）；验证 `internal_user_viewer` 角色的用户：其 key 能正常调用模型、无法创建 key（`/key/generate` 被拒）、无法登录 `/ui`；验证 `allowed_routes` 的取值能把 key 限制在模型调用路由内；验证 `GET /key/list` 按 `user_id` 过滤并返回可用于去重的 key 标识。
 2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户（含首个周期记录）、余额、月度用量、手动充值（钱包）、周期记录与月底结算任务（含最低月费与开通门槛）、月底前站内提醒任务、系统配置、对账停服任务。
 3. **M2 AIMeter 前端（用户自服务界面）**：概览（余额、预计月底扣费）、用量图、key 管理、充值记录、月度账单。
 4. **M3 加固**：低余额阈值通知（站内）、审计、监控告警、限流。
@@ -462,7 +474,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 来自一次独立评审，以下问题已确认但尚未写入正文设计：
 
 - 金额精度：LiteLLM 的 `max_budget`/`spend` 是浮点，下发时需统一舍入规则，并避免浮点误差影响 `spend >= max_budget` 的判定。
-- 用户权限：`internal_user` 可通过数据面端口调用 `/key/*` 自建带预算的 key，需在网关限制路由或用 `allowed_routes`；`/key/regenerate` 规范中存在，应补入 key 轮换与 API 表。
+- key 轮换：`/key/regenerate` 规范中存在，应补入 key 轮换与 API 表。
 - `billing_cycles` 增加同步状态字段（`synced_at`、最后下发的 `max_budget`、任务 run id）；`/user/new` 与 `/key/generate` 中途失败的补偿。
 - 钱包充值缺冲正/退款状态（Stripe 拒付）。
 - API 表缺：会话列表、管理员查看月度账单。
