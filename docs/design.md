@@ -94,9 +94,9 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 1. **自动层（LiteLLM 原生）**：`spend >= max_budget` 即拒绝请求，主防线，无需 AIMeter 介入。
 2. **主动层（AIMeter 对账任务）**：定时（如每分钟）分页扫描 `GET /user/list`（含 `spend`、`max_budget`），对每个用户按周期记录和实时 `spend` 计算剩余额度；未开通、剩余 ≤ `safety_reserve`、`manual_hold`、或 `spend < spend_start`（见 4.8 异常处理）时写停服态，并写审计、发通知；已开通且剩余 > `safety_reserve` 但处于停服态时（例如充值后）重算恢复。目的：处理预算字段被意外改动、并发超支后的收敛、欠费通知。
 3. **防透支（尽量压低，非绝对）**：LiteLLM 在请求**完成后**才记账，并发请求可能小幅越过上限，仅靠预算无法做到绝对零透支。措施：
-   - **并发限制：每用户 `max_parallel_requests = 2`**，同时设置请求的 `max_tokens` 上限（否则单次成本无上界）。
-   - `safety_reserve = 并发上限 × 单个请求最坏成本`（并发 2 即 2 倍）。开放哪些模型以 LiteLLM 为准，最坏成本由 LiteLLM 的模型元数据自动计算（`GET /model_group/info`，见 4.9）：单个请求最坏成本 = `max_input_tokens × input_cost_per_token + min(max_output_tokens, max_tokens 上限) × output_cost_per_token`，取所有开放模型的最大值。下发给 LiteLLM 的 `max_budget = limit − safety_reserve`，把保留额留给在途请求，使并发超支落在真实余额之内。保留额仍在钱包里、月底只按实际用量结算，**不会损失**；界面显示"可用余额 = 余额 − safety_reserve"。
-   - 另可设 `rpm_limit`、`tpm_limit`，缩小并发窗口。
+   - **并发限制：每用户 `max_parallel_requests = 2`**。不单独设置 `max_tokens` 上限：单个请求的输出以各模型自身的最大输出 token（LiteLLM 模型元数据 `max_output_tokens`）为上界。
+   - `safety_reserve = 并发上限 × 单个请求最坏成本`（并发 2 即 2 倍）。开放哪些模型以 LiteLLM 为准，最坏成本由 LiteLLM 的模型元数据自动计算（`GET /model_group/info`，见 4.9）：单个请求最坏成本 = `max_input_tokens × input_cost_per_token + max_output_tokens × output_cost_per_token`，取所有开放模型的最大值。下发给 LiteLLM 的 `max_budget = limit − safety_reserve`，把保留额留给在途请求，使并发超支落在真实余额之内。保留额仍在钱包里、月底只按实际用量结算，**不会损失**；界面显示"可用余额 = 余额 − safety_reserve"。
+   - v1 暂不设置 `rpm_limit`、`tpm_limit`（见 4.9）；若 M0 测得 `spend` 记账延迟较大，再启用以缩小并发窗口。
    - 若仍超出（`charge` 大于 钱包 + 当期充值），**不向用户追缴、钱包不记负数**：超出部分计入 `billing_cycles.overdraft`，由平台承担，触发告警，作为调整 `safety_reserve`/限流的依据。
    - 更严格的实时校验（pre-call 钩子，在请求前按 AIMeter 余额拒绝）作为 v2 可选加固。
 
@@ -233,16 +233,15 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 |---|---|---|
 | `billing_timezone` | 结算时区（IANA 名称，如 `Asia/Shanghai`、`UTC`）。决定周期边界、月度聚合和提醒的"距月底天数"。**修改后从下一个周期起生效**，避免打乱进行中的周期 | 待配置 |
 | `default_min_fee` | 全局默认最低月费，可被 `users.min_fee` 覆盖 | 由管理员配置 |
-| `default_rpm_limit` / `default_tpm_limit` | 每用户每分钟请求数 / token 数上限（可选的额外防护） | 待定，默认不设置 |
+| `default_rpm_limit` / `default_tpm_limit` | 每用户每分钟请求数 / token 数上限（可选的额外防护） | v1 不设置（留空） |
 | `max_parallel_requests` | 每用户并发上限 | 2 |
-| `max_tokens_cap` | 单个请求允许的最大输出 token 数，参与 `safety_reserve` 计算。强制方式待 M0 验证（须同时覆盖客户端未传 `max_tokens` 的情况） | 待定 |
 | `safety_reserve_mode` | `auto`：按 LiteLLM 模型元数据自动计算；`fixed`：管理员指定固定金额 | 默认 `auto` |
 | `reminder_days_before_end` | 月底前提醒的时间点（距月底天数） | `[7, 1]` |
 
 **开放模型以 LiteLLM 为准**：AIMeter 不单独维护模型列表，用户可用的模型就是 LiteLLM 中配置并开放给该用户的模型。
 
 **`safety_reserve` 自动计算（`auto`）**：后端定时（如每天，以及启动时）调用 `GET /model_group/info`，读取各模型组的 `max_input_tokens`、`max_output_tokens`、`input_cost_per_token`、`output_cost_per_token`，按 4.4 公式取最大值并乘以并发上限，得到全局 `safety_reserve`。注意：
-- 超长上下文模型会使最坏成本很大（整个上下文窗口按输入计价），可能让保留额远高于实际常见请求。此时可改用 `fixed` 模式，或缩小开放模型范围；因残余超支会记入 `overdraft`，可按实际观测调整。
+- 不设 `max_tokens_cap`，输出按各模型的 `max_output_tokens` 计，最大输出很长的模型同样会抬高最坏成本。超长上下文模型也会使最坏成本很大（整个上下文窗口按输入计价），可能让保留额远高于实际常见请求。此时可改用 `fixed` 模式，或缩小开放模型范围；因残余超支会记入 `overdraft`，可按实际观测调整。
 - 推理 token、缓存读写、分级定价（`tiered_pricing`）可能使实际成本高于线性估算，上线后以 `overdraft` 为依据校准。
 - 模型列表或价格变化时 `safety_reserve` 随之变化，下发的 `max_budget` 在下次重算时生效。
 
@@ -366,7 +365,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 | 风险 | 说明 | 应对 |
 |---|---|---|
-| 并发超支 | spend 在请求完成后记账，高并发会小幅超出 `max_budget`，无法做到绝对零透支 | 每用户并发 2 + `max_tokens` 上限 + `safety_reserve`；对账任务收敛；残余超支由平台承担、记 `overdraft` 并告警（见 4.4）；v2 可加 pre-call 钩子 |
+| 并发超支 | spend 在请求完成后记账，高并发会小幅超出 `max_budget`，无法做到绝对零透支 | 每用户并发 2 + `safety_reserve`（按模型最大输入/输出计算）；对账任务收敛；残余超支由平台承担、记 `overdraft` 并告警（见 4.4）；v2 可加 pre-call 钩子 |
 | 用户级并发限制是否覆盖所有 key | `max_parallel_requests` 若只在 key 级生效，用户多发 key 即可绕过"并发 2"，保留额随之失效 | M0 验证用户级限制；若不生效，限制每用户 key 数量或改在网关层做限制 |
 | 用户级 `blocked` 未实现 | 规范标注 `[Not Implemented Yet]`，且 `/v2/user/info` 不返回 | 不使用；停服统一用 `max_budget ≤ spend`；M0 验证边界判定 |
 | BETA 接口变动 | `daily/activity` 标注 BETA | 锁定 LiteLLM 版本；封装适配层；升级前跑契约测试 |
@@ -381,7 +380,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 ## 10. 里程碑
 
-1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟；验证用户级 `max_parallel_requests=2` 是否对该用户所有 key 生效；验证 `max_tokens_cap` 的强制方式（含客户端未传 `max_tokens` 时的默认上界）；测量请求完成后 `spend` 的记账延迟（决定并发窗口与 `rpm_limit` 是否必要）。
+1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟；验证用户级 `max_parallel_requests=2` 是否对该用户所有 key 生效；测量请求完成后 `spend` 的记账延迟（决定是否需要启用 `rpm_limit`/`tpm_limit`）；核对 `/model_group/info` 返回的 `max_input_tokens`/`max_output_tokens`/单价与实际开放模型一致，并估算 `safety_reserve` 的实际金额是否可接受。
 2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户（含首个周期记录）、余额、月度用量、手动充值（钱包）、周期记录与月底结算任务（含最低月费与开通门槛）、月底前站内提醒任务、系统配置、对账停服任务。
 3. **M2 AIMeter 前端（用户自服务界面）**：概览（余额、预计月底扣费）、用量图、key 管理、充值记录、月度账单。
 4. **M3 加固**：低余额阈值通知、邮件等其他通知渠道（含自助找回密码）、审计、监控告警、限流。
@@ -392,9 +391,9 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 - 技术栈（建议：后端 FastAPI + PostgreSQL，前端 React/Vue 任选；尚未确认）。
 - ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）；**v1 不做邮件发送**：账号由管理员开户，邀请/重置通过管理员转交一次性链接，不开放自助注册。仍待定：后续是否增加邮件渠道与自助注册；是否追加 OIDC 登录。
 - 余额单位（美元计价 vs 自定义"点数"；LiteLLM 内部以 USD 记账，点数需在 AIMeter 层换算）。
-- ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；仍待定：`max_tokens_cap`；`rpm_limit`/`tpm_limit` 默认值。
+- ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；**不设 `max_tokens_cap`**（输出按各模型 `max_output_tokens` 计）；**v1 不设置 `rpm_limit`/`tpm_limit`**。
 - ~~结算时区~~：已决定放在系统配置 `billing_timezone`（见 4.9），具体取值待配置，建议无夏令时的时区。
-- ~~月底前提醒~~：已决定要提醒（v1 仅站内提醒，不发邮件），余额不足最低月费的用户下个月停服（见 4.8）。仍待定：提醒时间点默认 `[7, 1]` 是否合适；是否增加其他提醒渠道。
+- ~~月底前提醒~~：已决定要提醒（v1 仅站内提醒，不发邮件），余额不足最低月费的用户下个月停服（见 4.8）。提醒时间点已确定为 `[7, 1]`；仍待定：是否增加其他提醒渠道。
 - ~~最低月费默认金额~~：已决定为系统配置项 `default_min_fee`（见 4.9），金额由管理员设置。
 - ~~月中开通~~：已决定按天折算（见 4.8）。
 
