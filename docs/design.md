@@ -61,7 +61,13 @@ AIMeter 前端 ──► AIMeter 后端 ─────────────�
 - pytest + pytest-asyncio；数据库测试使用真实的 PostgreSQL（容器），不用 SQLite 替代。
 - 对 LiteLLM 的调用在单元测试中用 mock（如 respx），另有针对 LiteLLM 测试实例的契约测试，覆盖 M0 的验证项。
 
-**前端**：框架尚未确定（React / Vue），见第 11 节。
+**前端**
+- 框架：**React**（单页应用）。以下为建议的配套选择，实现时可调整：TypeScript；Vite 构建；React Router 做路由；TanStack Query 做数据请求与缓存（配合 4.2 的"充值后立即失效缓存"，前端对应使缓存失效）。
+- 接口类型：由 FastAPI 生成的 OpenAPI 文档生成 TypeScript 类型，避免前后端字段不一致。
+- 认证：使用 Cookie 会话（4.7）。前后端部署在同一域名下（静态资源与 `/api` 由同一反向代理提供），不需要 CORS；状态变更请求携带 CSRF 令牌。
+- 金额：后端以字符串返回十进制金额，前端只格式化展示，**不用 JavaScript 浮点数做金额计算**；界面统一显示 `$`。
+- 页面：登录/设置密码、概览（余额、预计月底扣费、提醒横幅）、用量、月度账单、充值记录、Key 管理、API 令牌管理；管理员界面（开户、充值、最低月费、停服、重置链接、系统配置）。
+- 测试：Vitest + React Testing Library 做组件测试；关键流程（登录、查看余额、创建令牌）可用 Playwright 做端到端测试。
 
 ## 3. 核心概念映射
 
@@ -441,7 +447,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 ## 11. 待决策
 
-- ~~技术栈~~：后端已决定 FastAPI + PostgreSQL（仅支持 PostgreSQL，不支持 SQLite，见 2.1）。仍待定：前端框架（React / Vue）。
+- ~~技术栈~~：后端已决定 FastAPI + PostgreSQL（仅支持 PostgreSQL，不支持 SQLite，见 2.1）。前端已决定 React（见 2.1，TypeScript、Vite 等配套为建议项）。
 - ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）；**v1 不做邮件发送**：账号由管理员开户，邀请/重置通过管理员转交一次性链接，不开放自助注册。仍待定：后续是否增加邮件渠道与自助注册；是否追加 OIDC 登录。
 - ~~余额单位~~：已决定为美元（USD），界面以 `$` 显示，与 LiteLLM 同币种，不做汇率换算。
 - ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；**不设 `max_tokens_cap`**（输出按各模型 `max_output_tokens` 计）；**v1 不设置 `rpm_limit`/`tpm_limit`**。
