@@ -141,11 +141,45 @@ audit_log(id, actor, action, target_user, detail_json, created_at)
 
 ## 8. 安全
 
-- master key 仅存于后端环境变量/密钥管理，不入库、不下发。
+- master key 仅存于后端环境变量/密钥管理，不入库、不下发（详见 8.1）。
 - 后端到 LiteLLM 走内网；LiteLLM 管理接口不对公网暴露，仅公开数据面（`/v1/*`）。
 - 所有 `/api/me/*` 做会话鉴权 + 用户隔离；管理接口独立角色。
 - 新建 key 明文只返回一次。
 - 审计所有额度变更与封禁动作。
+
+### 8.1 Master key 说明与管理
+
+**是什么**：LiteLLM Proxy 的超级管理员密钥，持有者等同 `proxy_admin`，可调用全部管理接口（创建/删除用户、发 key、改预算、封禁、查看全部花费）。AIMeter 后端调用 `/user/new`、`/user/update` 等接口时使用它。
+
+**来源**：由部署者在部署 LiteLLM 时自行设定，LiteLLM 不会代为生成。二选一：
+
+```yaml
+# config.yaml
+general_settings:
+  master_key: sk-your-strong-secret
+```
+```bash
+export LITELLM_MASTER_KEY="sk-your-strong-secret"
+```
+
+要求：
+- 必须以 `sk-` 开头，用足够长的随机串，例如 `echo "sk-$(openssl rand -hex 32)"`。
+- 必须同时配置数据库（`DATABASE_URL`），否则虚拟 key、用户、预算、花费记录等功能不可用。
+
+**与 virtual key 的区别**：
+
+| | Master key | Virtual key |
+|---|---|---|
+| 来源 | 部署时配置 | 通过 `/key/generate` 创建 |
+| 权限 | 全部管理权限 | 只能调模型，受预算/模型/限流约束 |
+| 数量 | 一个 | 多个，每用户一个或多个 |
+| 持有者 | 仅 AIMeter 后端 | 终端用户 |
+
+**使用规则**：
+- 泄露等于整个网关失守：只放后端环境变量或密钥管理系统，不进代码仓库、不下发前端、不写入日志。
+- 仅用于管理，不用它调用模型。
+- 支持轮换：更换后同步更新 AIMeter 后端配置。
+- 降权方案（待验证，纳入 M0）：用 `/key/generate` 创建仅允许特定管理路由的受限 key（`allowed_routes`）交给 AIMeter 后端使用，而不是直接使用 master key，以缩小泄露影响面。
 
 ## 9. 风险与待验证
 
@@ -160,7 +194,7 @@ audit_log(id, actor, action, target_user, detail_json, created_at)
 
 ## 10. 里程碑
 
-1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构、`blocked` 行为。
+1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构、`blocked` 行为；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用。
 2. **M1 后端核心**：开户、余额、月度用量、手动充值、账本、对账封禁任务。
 3. **M2 自服务前端**：概览、用量图、key 管理、充值记录。
 4. **M3 加固**：低余额通知、审计、监控告警、限流。
