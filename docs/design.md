@@ -39,6 +39,29 @@ AIMeter 前端 ──► AIMeter 后端 ─────────────�
 - **master key 只存在于后端**，前端和用户永远拿不到。
 - **LiteLLM 是消费数据的事实来源，AIMeter 账本是充值数据的事实来源。**
 
+### 2.1 技术栈
+
+**后端**
+- 语言与框架：Python + **FastAPI**（异步），Pydantic v2 做请求/响应校验，自动生成 OpenAPI 文档。
+- 数据库：**仅支持 PostgreSQL**，不支持 SQLite。访问层用 SQLAlchemy 2.0（异步，asyncpg 驱动），迁移用 Alembic。
+- 调用 LiteLLM：用 httpx（异步）封装成独立的适配层模块，集中处理超时、重试、鉴权头、版本差异；锁定 LiteLLM 版本，并保留针对测试实例的契约测试（见第 9 节"BETA 接口变动"）。
+- 密码哈希：argon2-cffi（argon2id）。会话存 PostgreSQL（见 4.7），不使用无状态 JWT。
+- 配置：部署相关配置（数据库连接串、LiteLLM 地址、master key）用环境变量（pydantic-settings）；业务参数（4.9）存数据库 `system_config` 表，管理员可通过 API 修改。
+- 后台任务：月底结算、对账停服、月底前提醒、`safety_reserve` 刷新（见 4.4、4.8、4.9）。同一份代码以独立 worker 进程运行，也可通过开关在 API 进程内运行（单实例时）。任务用 PostgreSQL advisory lock 做互斥，保证多实例下同一任务不会重复执行。
+
+**PostgreSQL 使用约定（因只支持 PG，可直接使用其特性）**
+- 按用户串行化（4.8）：使用 `pg_advisory_xact_lock`（以用户 id 的哈希为键）或对 `users` 行 `SELECT ... FOR UPDATE`，在事务内完成"读周期记录 → 写 LiteLLM → 更新周期记录"。
+- 金额：钱包、充值、扣费等用 `NUMERIC(12,2)`（精确到分）；`spend_start`、`spend_end` 这类来自 LiteLLM 的浮点基线用 `NUMERIC(18,8)` 保存，避免浮点误差累积。
+- 时间：一律 `timestamptz`，以 UTC 存储，展示和周期计算时按 `billing_timezone` 转换。
+- 幂等：充值 `order_id`、`billing_cycles (user_id, month)`、`notifications` 都用唯一约束 + `INSERT ... ON CONFLICT` 实现。
+- 部署：AIMeter 使用独立的数据库和独立的数据库账号；若 LiteLLM 已有 PostgreSQL 服务器，可复用同一服务器但**不共用数据库**，也不直接读写 LiteLLM 的表，一律通过其 API。
+
+**测试**
+- pytest + pytest-asyncio；数据库测试使用真实的 PostgreSQL（容器），不用 SQLite 替代。
+- 对 LiteLLM 的调用在单元测试中用 mock（如 respx），另有针对 LiteLLM 测试实例的契约测试，覆盖 M0 的验证项。
+
+**前端**：框架尚未确定（React / Vue），见第 11 节。
+
 ## 3. 核心概念映射
 
 LiteLLM 没有"余额"字段，只有预算模型。映射如下：
@@ -228,7 +251,7 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 
 ### 4.9 系统配置项
 
-以下参数放在系统配置里，不写死在代码中：
+以下参数放在系统配置里（存于 `system_config` 表，管理员可通过 `/admin/config` 修改，变更写审计），不写死在代码中：
 
 | 配置项 | 说明 | 取值 |
 |---|---|---|
@@ -251,7 +274,7 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 **币种（美元）**
 - 全部金额为**美元（USD）**，界面以 `$` 显示，v1 仅此一种币种。钱包、充值、最低月费、月度账单与 LiteLLM 的 `spend`、`max_budget` 同币种，不做汇率换算。
 - LiteLLM 的 `spend` 以其模型单价计，预期为 USD（M0 核实）。
-- 精度：数据库金额使用 Decimal，统一四舍五入到分。
+- 精度：数据库金额使用 `NUMERIC`，统一四舍五入到分（见 2.1）。
 
 ## 5. AIMeter 后端 API（对外）
 
@@ -274,6 +297,8 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | GET | `/api/me/notifications` | 站内提醒（月底前提醒、下月停服通知） |
 | PUT | `/admin/users/{id}/min-fee` | 设置用户最低月费（空则用全局默认） |
 | POST | `/admin/users/{id}/reset-link` | 生成一次性重置密码链接，由管理员转交用户 |
+| GET | `/admin/config` | 读取系统配置（4.9） |
+| PUT | `/admin/config/{key}` | 修改系统配置项（写审计） |
 | POST | `/admin/users` | 开户 |
 | POST | `/admin/users/{id}/topup` | 手动充值 |
 | POST | `/admin/users/{id}/hold` / `unhold` | 手动停服/解除（`manual_hold`，通过预算实现，见 4.4） |
@@ -319,6 +344,7 @@ notifications(id, user_id, type[month_end_reminder|next_month_stopped|...],
               channel[in_app|email]  -- v1 仅 in_app, cycle_month,
               variant  -- 如提醒时间点, created_at, read_at,
               UNIQUE(user_id, type, cycle_month, variant, channel))
+system_config(key PK, value_json, updated_by, updated_at)
 ```
 
 （`topups` 即钱包充值；`applied` 的充值记入当期 `topups_total`。月度扣费记录在 `billing_cycles.charge`。）
@@ -394,7 +420,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 ## 11. 待决策
 
-- 技术栈（建议：后端 FastAPI + PostgreSQL，前端 React/Vue 任选；尚未确认）。
+- ~~技术栈~~：后端已决定 FastAPI + PostgreSQL（仅支持 PostgreSQL，不支持 SQLite，见 2.1）。仍待定：前端框架（React / Vue）。
 - ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）；**v1 不做邮件发送**：账号由管理员开户，邀请/重置通过管理员转交一次性链接，不开放自助注册。仍待定：后续是否增加邮件渠道与自助注册；是否追加 OIDC 登录。
 - ~~余额单位~~：已决定为美元（USD），界面以 `$` 显示，与 LiteLLM 同币种，不做汇率换算。
 - ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；**不设 `max_tokens_cap`**（输出按各模型 `max_output_tokens` 计）；**v1 不设置 `rpm_limit`/`tpm_limit`**。
