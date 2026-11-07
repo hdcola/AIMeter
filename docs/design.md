@@ -44,6 +44,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 | 业务概念 | LiteLLM 实现 |
 |---|---|
 | 用户 | Internal User（`/user/new`），`user_id` 与 AIMeter 用户一一对应 |
+| 用户登录凭据 | **不复用 LiteLLM**：邮箱密码由 AIMeter 自建（见 4.7），LiteLLM 侧不设 `password` |
 | 用户 API key | Virtual Key（`/key/generate`，绑定 `user_id`） |
 | 累计充值总额 | `max_budget`（用户级） |
 | 累计消费 | `spend`（用户级，LiteLLM 自动累加） |
@@ -58,8 +59,8 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 ## 4. 功能设计
 
 ### 4.1 开户
-1. AIMeter 创建用户记录。
-2. 调 `POST /user/new`：`user_id`、`user_email`、`user_role=internal_user`、`max_budget=<初始额度，可为 0>`、`auto_create_key=false`。
+1. AIMeter 创建用户记录（邮箱、角色、状态 `invited`），并发送设置密码邮件（见 4.7）。
+2. 调 `POST /user/new`：`user_id`（取 AIMeter `users.id`）、`user_email`、`user_role=internal_user`、`max_budget=<初始额度，可为 0>`、`auto_create_key=false`；**不传 `password`**。
 3. 调 `POST /key/generate`：绑定 `user_id`，**key 自身不设 `max_budget`**（避免与用户余额双重限制不一致），返回给用户一次（之后只显示后四位）。
 
 ### 4.2 余额查询
@@ -94,10 +95,48 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 - Key 管理：查看 key 后四位、新建/轮换/删除 key（`/key/generate`、`/key/update`，只允许操作自己的）。
 - 充值记录：账本列表。
 
+### 4.7 用户认证（自建邮箱密码）
+
+**决策**：AIMeter 自建邮箱 + 密码认证，不复用 LiteLLM 的登录体系。理由：LiteLLM 的账号密码与会话是为其 `/ui` 管理后台服务的（`/user/password/change` 仅限 UI 会话调用，`/session/logout` 仅接受 UI 会话 key），规范中没有面向第三方应用的"校验密码并签发令牌"接口；SSO 部分可能涉及企业版许可；且支付、通知、找回账号等需要自己掌控用户体系。
+
+**与 LiteLLM 的唯一耦合点**：`users.id` 即 LiteLLM 的 `user_id`（4.1 开户时同时创建）。LiteLLM 侧不设密码，其 `/ui` 仅管理员使用，不对终端用户开放；终端用户模型调用只用 virtual key，不涉及登录。
+
+**账户生命周期**
+- v1 采用**管理员开户（邀请制）**：管理员创建用户 → 系统发送一次性"设置密码"链接 → 用户设置密码后状态变为 `active`。是否开放自助注册见第 11 节。
+- 找回密码：邮箱发送一次性重置链接，令牌随机 32 字节、库中只存哈希、30 分钟过期、一次有效；重置成功后吊销该用户所有现有会话。
+- 修改密码：需输入旧密码；成功后吊销其他会话。
+- 邮箱变更：需新邮箱验证；同步调 `/user/update` 更新 LiteLLM 侧 `user_email`。
+
+**密码**
+- 使用 argon2id 哈希（带每用户随机盐），不可逆，库中不存明文。
+- 最小长度 10，不强制复杂字符组合；拒绝常见弱密码列表。
+
+**会话**
+- 服务端会话：登录后生成随机会话 ID，存 `sessions` 表（仅存哈希），通过 Cookie 下发：`HttpOnly; Secure; SameSite=Lax`。
+- 空闲 24 小时过期，绝对有效期 30 天；支持主动登出与"登出所有设备"（吊销即时生效，这是不用无状态 JWT 的原因）。
+- 状态变更类请求做 CSRF 防护（SameSite + CSRF token）。
+
+**防暴力破解**
+- 登录接口按 IP + 邮箱双维度限流；连续失败 5 次后该账户临时锁定 15 分钟（指数退避）。
+- 登录失败统一返回"邮箱或密码错误"，不暴露邮箱是否存在；找回密码接口同样不暴露。
+
+**角色**
+- `users.role`：`user` / `admin`。管理接口（`/admin/*`）要求 `admin`，与普通用户使用同一登录体系但独立授权。
+- 被封禁（`blocked`）或停用的用户：欠费封禁**只影响 LiteLLM 模型调用**，不影响登录，用户仍能登录查看账单并充值；仅账户 `disabled` 时禁止登录。
+
+**接口**见第 5 节认证部分。
+
 ## 5. AIMeter 后端 API（对外）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| POST | `/api/auth/login` | 邮箱密码登录，下发会话 Cookie |
+| POST | `/api/auth/logout` | 登出当前会话 |
+| POST | `/api/auth/logout-all` | 登出所有设备 |
+| POST | `/api/auth/password/set` | 凭邀请/重置令牌设置密码 |
+| POST | `/api/auth/password/forgot` | 申请重置邮件（始终返回成功） |
+| POST | `/api/me/password` | 修改密码（需旧密码） |
+| GET | `/api/me` | 当前用户资料与角色 |
 | GET | `/api/me/balance` | 余额、已用、状态 |
 | GET | `/api/me/usage/monthly?from=&to=` | 月度汇总 |
 | GET | `/api/me/usage/daily?month=YYYY-MM` | 某月按日明细（含模型拆分） |
@@ -129,7 +168,11 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 ## 7. 数据模型（AIMeter DB）
 
 ```
-users(id, litellm_user_id, email, created_at, status)
+users(id  -- 同时作为 LiteLLM user_id,
+      email UNIQUE, password_hash, role[user|admin],
+      status[invited|active|disabled], failed_logins, locked_until, created_at)
+sessions(id_hash PK, user_id, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at)
+auth_tokens(token_hash PK, user_id, purpose[invite|reset|email_change], expires_at, used_at)
 topups(id, user_id, order_id UNIQUE, amount, currency, status[pending|applied|failed],
        source[manual|stripe], created_at, applied_at)
 monthly_usage(user_id, month, spend, prompt_tokens, completion_tokens,
@@ -143,7 +186,7 @@ audit_log(id, actor, action, target_user, detail_json, created_at)
 
 - master key 仅存于后端环境变量/密钥管理，不入库、不下发（详见 8.1）。
 - 后端到 LiteLLM 走内网；LiteLLM 管理接口不对公网暴露，仅公开数据面（`/v1/*`）。
-- 所有 `/api/me/*` 做会话鉴权 + 用户隔离；管理接口独立角色。
+- 所有 `/api/me/*` 做会话鉴权 + 用户隔离；管理接口独立角色。认证细节见 4.7（argon2id、服务端会话、登录限流）。
 - 新建 key 明文只返回一次。
 - 审计所有额度变更与封禁动作。
 
@@ -195,7 +238,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 ## 10. 里程碑
 
 1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构、`blocked` 行为；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用。
-2. **M1 后端核心**：开户、余额、月度用量、手动充值、账本、对账封禁任务。
+2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户、余额、月度用量、手动充值、账本、对账封禁任务。
 3. **M2 自服务前端**：概览、用量图、key 管理、充值记录。
 4. **M3 加固**：低余额通知、审计、监控告警、限流。
 5. **M4 支付接入**：Stripe 等，回调幂等。
@@ -203,6 +246,6 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 ## 11. 待决策
 
 - 技术栈（建议：后端 FastAPI + PostgreSQL，前端 React/Vue 任选；尚未确认）。
-- 用户认证方式（自建账号 / OIDC SSO）。
+- ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）。仍待定：是否开放自助注册（含邮箱验证）；SMTP/邮件发送服务选型；后续是否追加 OIDC 登录。
 - 余额单位（美元计价 vs 自定义"点数"；LiteLLM 内部以 USD 记账，点数需在 AIMeter 层换算）。
 - 是否允许小额透支。
