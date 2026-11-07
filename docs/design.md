@@ -14,7 +14,7 @@
 
 ### 非目标（v1 不做）
 - 支付网关对接细节（仅预留充值入口与回调接口，v1 提供管理员手动充值）。
-- 正式发票开具、税务、多币种（v1 仅加元 CAD，界面以 `$` 显示）。
+- 正式发票开具、税务、多币种（v1 仅美元 USD，界面以 `$` 显示）。
 - 邮件发送（v1 不做）：提醒走站内通知；邀请开户与重置密码由管理员转交一次性链接；不开放自助注册。
 - 团队/组织级计费（v1 只做个人用户维度）。
 
@@ -50,7 +50,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 | 用户 API key | Virtual Key（`/key/generate`，绑定 `user_id`） |
 | 额度上限 | `max_budget`（用户级）。= 周期起始 `spend` + 钱包可用额度 − `safety_reserve`，由 AIMeter 重算并下发（见 4.8） |
 | 累计消费 | `spend`（用户级，**不重置**，LiteLLM 自动累加，是只增的终身计数器） |
-| 币种 | AIMeter 钱包与账单为**加元（CAD）**，界面显示 `$`；LiteLLM 的 `spend`/`max_budget` 以其模型单价为准，通常为 USD（M0 核实），按 `usd_to_cad` 换算（见 4.9） |
+| 币种 | 全部为**美元（USD）**，界面显示 `$`；AIMeter 的钱包、账单与 LiteLLM 的 `spend`/`max_budget` 使用同一币种，无汇率换算（LiteLLM 的 `spend` 币种由模型单价决定，预期为 USD，M0 核实） |
 | **余额（钱包）** | `limit − spend`，其中 `limit = 周期起始 spend + 周期起始钱包 + 当期充值`；钱包只有一类，不过期、滚存 |
 | 充值 | 钱包增加，重算并下发 `max_budget`（`/user/update`） |
 | 月底结算 | 在 AIMeter 内完成：`扣费 = max(当月用量, 最低月费)`，从钱包扣除；LiteLLM 只负责实时限额 |
@@ -169,31 +169,28 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 周期开始：
   spend_start  = 上一周期的 spend_end（首个周期：开户时读取的 LiteLLM spend）
   wallet_start = 上一周期的 wallet_end（首个周期：0）
-  fx           = 本周期使用的汇率 usd_to_cad（快照，见 4.9）
-  开通判定：wallet_start ≥ min_fee 且 wallet_start > safety_reserve × fx → activated_at = 周期开始，min_fee_cycle = min_fee；否则未开通
-  limit        = spend_start + (wallet_start + topups_total) / fx      -- LiteLLM 口径（USD）
+  开通判定：wallet_start ≥ min_fee 且 wallet_start > safety_reserve → activated_at = 周期开始，min_fee_cycle = min_fee；否则未开通
+  limit        = spend_start + wallet_start + topups_total
   max_budget   = limit − safety_reserve          -- 已开通且未手动停服
                = 实时 spend                      -- 未开通 / manual_hold / 剩余 ≤ safety_reserve（停服态）
 
 周期内（每次变更都重算，不做增量累加）：
   充值 T：   topups_total += T；若本周期未开通，重新判定开通条件：
                min_fee_cycle = min_fee × 剩余天数 / 当月总天数（剩余天数含充值当日）
-               wallet_start + topups_total ≥ min_fee_cycle 且 > safety_reserve × fx → 置 activated_at；重算 limit / max_budget
-  余额（CAD） = (limit − spend) × fx
-  预计月底扣费 = max((spend − spend_start) × fx, min_fee_cycle)     -- 已开通周期，CAD
+               wallet_start + topups_total ≥ min_fee_cycle 且 > safety_reserve → 置 activated_at；重算 limit / max_budget
+  余额       = limit − spend
+  预计月底扣费 = max(spend − spend_start, min_fee_cycle)     -- 已开通周期
 
 周期结束结算：
   spend_end    = 结算时读取的 LiteLLM spend（写入周期记录后不再改）
-  usage        = (spend_end − spend_start) × fx                      -- CAD
+  usage        = spend_end − spend_start
   charge       = max(usage, min_fee_cycle)  若本周期已开通，否则 usage
   wallet_end   = max(0, wallet_start + topups_total − charge)
   overdraft    = max(0, charge − (wallet_start + topups_total))   -- 并发超支：平台承担，不追缴，记录并告警（见 4.4）
   下一周期：spend_start' = spend_end，wallet_start' = wallet_end
 ```
 
-说明：除 `spend`、`max_budget`、`limit`、`safety_reserve`（LiteLLM 口径）外，其余金额均为加元；换算规则见 4.9「币种与汇率」。
-
-**数值示例**（`min_fee = $50`，`fx = 1`，`safety_reserve` 忽略不计）：
+**数值示例**（`min_fee = $50`，`safety_reserve` 忽略不计）：
 | 情形 | 月初钱包 | 当月用量 | 扣费 | 月末钱包 | 下月 |
 |---|---|---|---|---|---|
 | 用得少 | 120 | 20 | 50（保底） | 70 | 开通（70 ≥ 50） |
@@ -236,7 +233,6 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | 配置项 | 说明 | 取值 |
 |---|---|---|
 | `billing_timezone` | 结算时区（IANA 名称，如 `Asia/Shanghai`、`UTC`）。决定周期边界、月度聚合和提醒的"距月底天数"。**修改后从下一个周期起生效**，避免打乱进行中的周期 | 待配置 |
-| `usd_to_cad` | 汇率：1 USD 折合多少 CAD，用于 LiteLLM 口径与加元之间的换算。管理员手动配置，**修改后从下一个周期起生效**，并快照到 `billing_cycles.fx_rate`（见下「币种与汇率」） | 待配置 |
 | `default_min_fee` | 全局默认最低月费，可被 `users.min_fee` 覆盖 | 由管理员配置 |
 | `default_rpm_limit` / `default_tpm_limit` | 每用户每分钟请求数 / token 数上限（可选的额外防护） | v1 不设置（留空） |
 | `max_parallel_requests` | 每用户并发上限 | 2 |
@@ -252,13 +248,9 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 
 **时区与 LiteLLM 的差异**：`/user/daily/activity` 的 `timezone` 参数是整数分钟偏移，不是时区名。若配置了有夏令时的时区，同一个月内偏移可能变化，需分段查询；建议配置无夏令时的时区。`timezone` 参数的确切语义纳入 M0 验证。
 
-**币种与汇率（加元）**
-- 钱包、充值、最低月费、月度账单等 AIMeter 内的金额一律为**加元（CAD）**，界面以 `$` 显示（v1 仅此一种币种）。
-- LiteLLM 的 `spend`、`max_budget` 以 LiteLLM 的模型单价为准，通常是美元（USD，M0 核实）。两者通过系统配置 `usd_to_cad` 换算。
-- 汇率 v1 由管理员手动配置，修改后从下一个周期起生效，并快照到 `billing_cycles.fx_rate`。**一个周期内汇率固定**，保证周期内的 `limit`、余额和月底结算一致。
-- 换算规则（见 4.8 公式）：下发给 LiteLLM 的额度 = 加元额度 ÷ `fx`；用量 = LiteLLM 用量差 × `fx`；`safety_reserve` 由 LiteLLM 单价算出（USD 口径），与钱包比较时乘 `fx`。
-- 汇率波动会让同样的用量在不同周期折合的加元不同，这是预期行为；汇率过期不更新会让加元扣费偏离实际成本，需要管理员定期维护（后续可考虑自动获取汇率并记录历史）。
-- 替代做法（未验证）：在 LiteLLM 里把模型单价直接配置为加元（自定义定价），并令 `usd_to_cad = 1`，可免去换算。需先确认 LiteLLM 自定义单价的覆盖范围。
+**币种（美元）**
+- 全部金额为**美元（USD）**，界面以 `$` 显示，v1 仅此一种币种。钱包、充值、最低月费、月度账单与 LiteLLM 的 `spend`、`max_budget` 同币种，不做汇率换算。
+- LiteLLM 的 `spend` 以其模型单价计，预期为 USD（M0 核实）。
 - 精度：数据库金额使用 Decimal，统一四舍五入到分。
 
 ## 5. AIMeter 后端 API（对外）
@@ -320,7 +312,6 @@ monthly_usage(user_id, month, spend, prompt_tokens, completion_tokens,
 audit_log(id, actor, action, target_user, detail_json, created_at)
 billing_cycles(user_id, month, spend_start, spend_end, min_fee  -- 本周期快照,
                min_fee_cycle  -- 按天折算后的保底额,
-               fx_rate  -- 本周期使用的 USD→CAD 汇率快照,
                activated_at  -- 空=本周期未开通, wallet_start, topups_total,
                usage, charge, wallet_end, overdraft, status[open|closed], closed_at,
                PRIMARY KEY(user_id, month))
@@ -382,7 +373,6 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 |---|---|---|
 | 并发超支 | spend 在请求完成后记账，高并发会小幅超出 `max_budget`，无法做到绝对零透支 | 每用户并发 2 + `safety_reserve`（按模型最大输入/输出计算）；对账任务收敛；残余超支由平台承担、记 `overdraft` 并告警（见 4.4）；v2 可加 pre-call 钩子 |
 | 用户级并发限制是否覆盖所有 key | `max_parallel_requests` 若只在 key 级生效，用户多发 key 即可绕过"并发 2"，保留额随之失效 | M0 验证用户级限制；若不生效，限制每用户 key 数量或改在网关层做限制 |
-| 汇率与币种 | LiteLLM 以 USD 记账而钱包为 CAD，汇率手动配置，过期或配置错误会让扣费偏离实际成本 | 周期内汇率固定并快照；变更仅下周期生效；变更写审计；后续可自动获取汇率；M0 核实 LiteLLM 的 `spend` 币种 |
 | 用户级 `blocked` 未实现 | 规范标注 `[Not Implemented Yet]`，且 `/v2/user/info` 不返回 | 不使用；停服统一用 `max_budget ≤ spend`；M0 验证边界判定 |
 | BETA 接口变动 | `daily/activity` 标注 BETA | 锁定 LiteLLM 版本；封装适配层；升级前跑契约测试 |
 | 企业版限制 | 部分报表/SSO 可能需 Enterprise 许可 | 实现前逐项核对许可证；核心路径只用开源接口 |
@@ -406,7 +396,7 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 
 - 技术栈（建议：后端 FastAPI + PostgreSQL，前端 React/Vue 任选；尚未确认）。
 - ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）；**v1 不做邮件发送**：账号由管理员开户，邀请/重置通过管理员转交一次性链接，不开放自助注册。仍待定：后续是否增加邮件渠道与自助注册；是否追加 OIDC 登录。
-- ~~余额单位~~：已决定为加元（CAD），界面以 `$` 显示；与 LiteLLM（USD）之间按系统配置 `usd_to_cad` 换算（见 4.9）。仍待定：汇率取值与维护方式（v1 手动配置）。
+- ~~余额单位~~：已决定为美元（USD），界面以 `$` 显示，与 LiteLLM 同币种，不做汇率换算。
 - ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；**不设 `max_tokens_cap`**（输出按各模型 `max_output_tokens` 计）；**v1 不设置 `rpm_limit`/`tpm_limit`**。
 - ~~结算时区~~：已决定放在系统配置 `billing_timezone`（见 4.9），具体取值待配置，建议无夏令时的时区。
 - ~~月底前提醒~~：已决定要提醒（v1 仅站内提醒，不发邮件），余额不足最低月费的用户下个月停服（见 4.8）。提醒时间点已确定为 `[7, 1]`；仍待定：是否增加其他提醒渠道。
