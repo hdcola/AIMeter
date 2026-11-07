@@ -263,7 +263,7 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
   `projected_wallet_end = wallet_start + topups_total − max(usage_so_far, min_fee_cycle)`
 - 若 `projected_wallet_end < min_fee`（下个周期的完整最低月费），则生成**站内提醒**（v1 不发邮件，见 4.7），内容包括：当前余额、本月已用、预计月底扣费、预计月末余额、**至少需充值** `min_fee − projected_wallet_end`（此后用量越多，所需越多），以及"不充值则下月停服"的明确说明。
 - 提醒时间点由配置 `reminder_days_before_end` 决定，默认 `[7, 1]`（距月底 7 天、1 天各一次）。以 `notifications (user_id, type, cycle_month, variant)` 唯一键保证同一周期同一时间点只发一次；用户充值后条件不再满足则不再发送。
-- 展示：用户登录后在概览页显示醒目横幅与所需充值额，并写入站内通知（`GET /api/me/notifications`）。**局限**：v1 没有邮件，用户若不登录就看不到提醒；后续可增加邮件或其他渠道（`notifications.channel` 已预留）。
+- 展示：用户登录后在概览页显示醒目横幅与所需充值额，并写入站内通知（`GET /api/me/notifications`）。**局限**：没有邮件等其他渠道，用户若不登录就看不到提醒，下个月照常按规则停服；这是已接受的取舍（管理员可在月底前人工通知欠费用户）。
 - 兜底：月底结算后若余额仍不足，下个月按"开通门槛"不开通服务（停服态），并写入"下月已停服，充值达标后立即恢复"的站内通知（每月任务第 3 步）。
 
 **v1 支付**：充值由管理员确认到账后手动录入（`/admin/users/{id}/topup`）；接入 Stripe 后改为回调自动入账（M4）。
@@ -442,17 +442,17 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟；验证用户级 `max_parallel_requests=2` 是否对该用户所有 key 生效；测量请求完成后 `spend` 的记账延迟（决定是否需要启用 `rpm_limit`/`tpm_limit`）；核对 `/model_group/info` 返回的 `max_input_tokens`/`max_output_tokens`/单价与实际开放模型一致，并估算 `safety_reserve` 的实际金额是否可接受；核实 LiteLLM `spend`/模型单价的币种（预期为 USD）。
 2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户（含首个周期记录）、余额、月度用量、手动充值（钱包）、周期记录与月底结算任务（含最低月费与开通门槛）、月底前站内提醒任务、系统配置、对账停服任务。
 3. **M2 AIMeter 前端（用户自服务界面）**：概览（余额、预计月底扣费）、用量图、key 管理、充值记录、月度账单。
-4. **M3 加固**：低余额阈值通知、邮件等其他通知渠道（含自助找回密码）、审计、监控告警、限流。
+4. **M3 加固**：低余额阈值通知（站内）、审计、监控告警、限流。
 5. **M4 支付接入**：Stripe 等，回调幂等。
 
 ## 11. 待决策
 
 - ~~技术栈~~：后端已决定 FastAPI + PostgreSQL（仅支持 PostgreSQL，不支持 SQLite，见 2.1）。前端已决定 React（见 2.1，TypeScript、Vite 等配套为建议项）。
-- ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）；**v1 不做邮件发送**：账号由管理员开户，邀请/重置通过管理员转交一次性链接，不开放自助注册。**不考虑 OIDC 登录**。仍待定：后续是否增加邮件渠道与自助注册。
+- ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）；**v1 不做邮件发送**：账号由管理员开户，邀请/重置通过管理员转交一次性链接，不开放自助注册。**不考虑 OIDC 登录**。**不增加邮件渠道，也不提供自助注册**。
 - ~~余额单位~~：已决定为美元（USD），界面以 `$` 显示，与 LiteLLM 同币种，不做汇率换算。
 - ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；**不设 `max_tokens_cap`**（输出按各模型 `max_output_tokens` 计）；**v1 不设置 `rpm_limit`/`tpm_limit`**。
 - ~~结算时区~~：已决定放在系统配置 `billing_timezone`（见 4.9），具体取值待配置，建议无夏令时的时区。
-- ~~月底前提醒~~：已决定要提醒（v1 仅站内提醒，不发邮件），余额不足最低月费的用户下个月停服（见 4.8）。提醒时间点已确定为 `[7, 1]`；**v1 不追加其他提醒渠道**（`notifications.channel` 已预留，后续再议）。
+- ~~月底前提醒~~：已决定要提醒（v1 仅站内提醒，不发邮件），余额不足最低月费的用户下个月停服（见 4.8）。提醒时间点已确定为 `[7, 1]`；**不追加其他提醒渠道**（`notifications.channel` 字段保留，但不计划增加）。
 - ~~最低月费默认金额~~：已决定为系统配置项 `default_min_fee`（见 4.9），金额由管理员设置。
 - ~~月中开通~~：已决定按天折算（见 4.8）。
 
@@ -464,6 +464,6 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 - 用户权限：`internal_user` 可通过数据面端口调用 `/key/*` 自建带预算的 key，需在网关限制路由或用 `allowed_routes`；`/key/regenerate` 规范中存在，应补入 key 轮换与 API 表。
 - `billing_cycles` 增加同步状态字段（`synced_at`、最后下发的 `max_budget`、任务 run id）；`/user/new` 与 `/key/generate` 中途失败的补偿。
 - 钱包充值缺冲正/退款状态（Stripe 拒付）。
-- API 表缺：会话列表、管理员查看月度账单；邮件上线后补：邀请重发、自助找回密码、改邮箱验证。
+- API 表缺：会话列表、管理员查看月度账单。
 - 安全：`DELETE /api/me/keys/{id}` 的归属校验（IDOR）与 key 数量上限；管理员充值/调整需二次验证；登录锁定可被用于恶意锁号；`audit_log` 与 `topups`/`billing_cycles` 的关联。
 - 风险表中 `max_internal_user_budget` 周期的表述在规范中无法核实，需重新措辞。
