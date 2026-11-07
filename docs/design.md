@@ -74,7 +74,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 ### 4.3 月度用量
 - 后端调 `GET /user/daily/activity?user_id=&start_date=&end_date=&timezone=`，返回按日的 `spend`、tokens、`api_requests`，并含 model/provider/api_key 拆分。
 - **`timezone` 是整数分钟偏移，不是时区名**（规范原文：Timezone offset in minutes from UTC，沿用 JavaScript `Date.getTimezoneOffset()` 约定，符号相反：UTC+8 传 `-480`）；`start_date`/`end_date` 为 `YYYY-MM-DD` 字符串。
-- 月度聚合统一使用**结算时区**（见 4.8，所有用户相同，不使用无夏令时的固定偏移以外的时区），由后端自行计算月边界后传 `start_date`/`end_date` 与对应偏移；不做按用户时区的聚合。
+- 月度聚合统一使用**结算时区**（系统配置 `billing_timezone`，见 4.9，所有用户相同），由后端自行计算月边界后传 `start_date`/`end_date` 与对应的分钟偏移；不做按用户时区的聚合。
 - **口径**：展示用 daily activity；计费结算用 `billing_cycles` 中记录的 `spend` 差值（4.8）。两者在边界上可能有微小差异（规范说明 daily 累计可能大于 `spend`），以 `billing_cycles` 为计费准，界面注明用量统计为参考口径。
 - 重要：必须使用 daily activity，**不能用 `spend` 当月账单**。官方说明 daily activity 只增不减、不受预算重置影响。
 - 已结束的月份固化到 AIMeter DB（`monthly_usage`），避免反复拉取，也防止上游数据保留策略变化。
@@ -94,12 +94,12 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 2. **主动层（AIMeter 对账任务）**：定时（如每分钟）分页扫描 `GET /user/list`（含 `spend`、`max_budget`），对每个用户按周期记录和实时 `spend` 计算剩余额度；未开通、剩余 ≤ `safety_reserve`、`manual_hold`、或 `spend < spend_start`（见 4.8 异常处理）时写停服态，并写审计、发通知；已开通且剩余 > `safety_reserve` 但处于停服态时（例如充值后）重算恢复。目的：处理预算字段被意外改动、并发超支后的收敛、欠费通知。
 3. **防透支（尽量压低，非绝对）**：LiteLLM 在请求**完成后**才记账，并发请求可能小幅越过上限，仅靠预算无法做到绝对零透支。措施：
    - **并发限制：每用户 `max_parallel_requests = 2`**，同时设置请求的 `max_tokens` 上限（否则单次成本无上界）。
-   - `safety_reserve = 2 × 单个请求最坏成本`，单个请求最坏成本 = 最大输入 token × 输入单价 + `max_tokens` 上限 × 输出单价，按开放的最贵模型取值。下发给 LiteLLM 的 `max_budget = limit − safety_reserve`，把保留额留给在途请求，使并发超支落在真实余额之内。保留额仍在钱包里、月底只按实际用量结算，**不会损失**；界面显示"可用余额 = 余额 − safety_reserve"。
+   - `safety_reserve = 并发上限 × 单个请求最坏成本`（并发 2 即 2 倍）。开放哪些模型以 LiteLLM 为准，最坏成本由 LiteLLM 的模型元数据自动计算（`GET /model_group/info`，见 4.9）：单个请求最坏成本 = `max_input_tokens × input_cost_per_token + min(max_output_tokens, max_tokens 上限) × output_cost_per_token`，取所有开放模型的最大值。下发给 LiteLLM 的 `max_budget = limit − safety_reserve`，把保留额留给在途请求，使并发超支落在真实余额之内。保留额仍在钱包里、月底只按实际用量结算，**不会损失**；界面显示"可用余额 = 余额 − safety_reserve"。
    - 另可设 `rpm_limit`、`tpm_limit`，缩小并发窗口。
    - 若仍超出（`charge` 大于 钱包 + 当期充值），**不向用户追缴、钱包不记负数**：超出部分计入 `billing_cycles.overdraft`，由平台承担，触发告警，作为调整 `safety_reserve`/限流的依据。
    - 更严格的实时校验（pre-call 钩子，在请求前按 AIMeter 余额拒绝）作为 v2 可选加固。
 
-**预警**：可用余额低于阈值（如 20%）通过邮件通知（v1 可选）。
+**预警**：月底前提醒见 4.8「月底前提醒」；另可在可用余额低于阈值（如 20%）时通知（可选）。
 
 ### 4.5 充值
 - v1：管理员后台手动充值（`POST /admin/users/{id}/topup`）。
@@ -155,7 +155,7 @@ LiteLLM 没有"余额"字段，只有预算模型。映射如下：
 - **开通门槛**：钱包余额 ≥ `min_fee`（且 > `safety_reserve`）才开通该周期的服务。每月结算后若余额不足 `min_fee`，**下个月不开通服务**（停服态）；充值达标后立即开通。
 - 保底只对**开通过**的周期收取：周期内一直未达门槛的月份不收最低月费。月中开通的当月，默认按整月 `min_fee` 收取（是否折算见第 11 节）。
 - 已开通周期内因用量耗尽而停服的用户，充值后立即恢复，无需再过门槛（保底已在本月承诺）。
-- 周期：自然月，使用统一的结算时区（见第 11 节），所有用户同一周期。
+- 周期：自然月，使用统一的结算时区（系统配置 `billing_timezone`，见 4.9），所有用户同一周期。
 
 **为什么余额一定够扣**：开通要求钱包 ≥ `min_fee`；月内用量被预算限制在钱包之内。因此 `max(用量, min_fee) ≤ 钱包`，月底扣费不会出现余额不足的情况；唯一例外是并发超支，按 4.4 由平台承担并记录 `overdraft`。
 
@@ -211,7 +211,38 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 3. 开启新周期：写入新记录，按开通判定设置 `activated_at`，调 `/user/update` 设置新 `max_budget`（未达门槛则写停服态）；写入后回读 `/v2/user/info` 校验 `max_budget`，不一致则重试并告警。对未达门槛的用户发送"余额不足最低月费，请充值"通知。
 4. **任务延迟的影响**：窗口内 `max_budget` 仍是上月值——余额已耗尽的用户继续被拒；未达新门槛的用户仍可在旧上限内使用，这部分用量计入旧周期并在结算时扣费，以其钱包余额为上界，v1 接受。任务应在周期边界后立即运行，记录 `closed_at` 并监控延迟（超过阈值如 5 分钟告警）。
 
+**月底前提醒（若不充值，下月将停服）**
+- 目的：在周期结束前告知用户，如果不充值，下个月会因钱包余额不足最低月费而不开通服务。
+- 提醒任务每日运行，按结算时区计算"距周期结束还有几天"。对**已开通**的用户计算（假设此后不再产生用量）：
+  `projected_wallet_end = wallet_start + topups_total − max(usage_so_far, min_fee)`
+- 若 `projected_wallet_end < min_fee`，则发送邮件提醒，内容包括：当前余额、本月已用、预计月底扣费、预计月末余额、**至少需充值** `min_fee − projected_wallet_end`（此后用量越多，所需越多），以及"不充值则下月停服"的明确说明。
+- 提醒时间点由配置 `reminder_days_before_end` 决定，默认 `[7, 1]`（距月底 7 天、1 天各一次）。以 `notifications (user_id, type, cycle_month, variant)` 唯一键保证同一周期同一时间点只发一次；用户充值后条件不再满足则不再发送。
+- 界面同步：概览页在满足条件时显示醒目横幅与所需充值额。
+- 兜底：月底结算后若余额仍不足，下个月按"开通门槛"不开通服务（停服态），并发送"下月已停服，充值达标后立即恢复"的通知（每月任务第 3 步）。
+
 **v1 支付**：充值由管理员确认到账后手动录入（`/admin/users/{id}/topup`）；接入 Stripe 后改为回调自动入账（M4）。
+
+### 4.9 系统配置项
+
+以下参数放在系统配置里，不写死在代码中：
+
+| 配置项 | 说明 | 取值 |
+|---|---|---|
+| `billing_timezone` | 结算时区（IANA 名称，如 `Asia/Shanghai`、`UTC`）。决定周期边界、月度聚合和提醒的"距月底天数"。**修改后从下一个周期起生效**，避免打乱进行中的周期 | 待配置 |
+| `default_min_fee` | 全局默认最低月费，可被 `users.min_fee` 覆盖 | 待定金额 |
+| `max_parallel_requests` | 每用户并发上限 | 2 |
+| `max_tokens_cap` | 请求 `max_tokens` 上限，参与 `safety_reserve` 计算 | 待定 |
+| `safety_reserve_mode` | `auto`：按 LiteLLM 模型元数据自动计算；`fixed`：管理员指定固定金额 | 默认 `auto` |
+| `reminder_days_before_end` | 月底前提醒的时间点（距月底天数） | `[7, 1]` |
+
+**开放模型以 LiteLLM 为准**：AIMeter 不单独维护模型列表，用户可用的模型就是 LiteLLM 中配置并开放给该用户的模型。
+
+**`safety_reserve` 自动计算（`auto`）**：后端定时（如每天，以及启动时）调用 `GET /model_group/info`，读取各模型组的 `max_input_tokens`、`max_output_tokens`、`input_cost_per_token`、`output_cost_per_token`，按 4.4 公式取最大值并乘以并发上限，得到全局 `safety_reserve`。注意：
+- 超长上下文模型会使最坏成本很大（整个上下文窗口按输入计价），可能让保留额远高于实际常见请求。此时可改用 `fixed` 模式，或缩小开放模型范围；因残余超支会记入 `overdraft`，可按实际观测调整。
+- 推理 token、缓存读写、分级定价（`tiered_pricing`）可能使实际成本高于线性估算，上线后以 `overdraft` 为依据校准。
+- 模型列表或价格变化时 `safety_reserve` 随之变化，下发的 `max_budget` 在下次重算时生效。
+
+**时区与 LiteLLM 的差异**：`/user/daily/activity` 的 `timezone` 参数是整数分钟偏移，不是时区名。若配置了有夏令时的时区，同一个月内偏移可能变化，需分段查询；建议配置无夏令时的时区。`timezone` 参数的确切语义纳入 M0 验证。
 
 ## 5. AIMeter 后端 API（对外）
 
@@ -250,6 +281,7 @@ LiteLLM 每个用户只有一个 `max_budget`、一个 `spend`。我们让 `spen
 | 月度/日度用量 | `GET /user/daily/activity` |
 | 发/改/删 key | `POST /key/generate`、`/key/update`、`/key/delete` |
 | 明细对账（可选） | `GET /spend/logs` |
+| 模型列表与单价（计算 `safety_reserve`） | `GET /model_group/info` |
 | 终端客户模式（备选） | `/customer/new`、`/customer/block`、`/customer/daily/activity` |
 
 备选：若用户并不登录 LiteLLM、只通过请求里的 `user` 字段标识，可使用 Customer（End User）模型。本设计选 Internal User 是因为需要为每个用户发独立 key。
@@ -272,6 +304,8 @@ billing_cycles(user_id, month, spend_start, spend_end, min_fee  -- 本周期快�
                activated_at  -- 空=本周期未开通, wallet_start, topups_total,
                usage, charge, wallet_end, overdraft, status[open|closed], closed_at,
                PRIMARY KEY(user_id, month))
+notifications(id, user_id, type[month_end_reminder|next_month_stopped|...], cycle_month,
+              variant  -- 如提醒时间点, sent_at, UNIQUE(user_id, type, cycle_month, variant))
 ```
 
 （`topups` 即钱包充值；`applied` 的充值记入当期 `topups_total`。月度扣费记录在 `billing_cycles.charge`。）
@@ -340,9 +374,9 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 ## 10. 里程碑
 
 1. **M0 验证（1–2 天）**：起 LiteLLM 测试实例，验证预算超限拒绝、用户级预算对多 key、daily activity 返回结构；验证"`max_budget` 设为当前 `spend`"能否拒绝请求（`>=` 边界）、恢复后是否立即生效；验证受限管理 key（`allowed_routes`）能否替代 master key 完成后端所需的全部管理调用；验证不设 `budget_duration` 时 `spend` 只增不减、`/user/update` 调整 `max_budget` 不影响 `spend` 且立即生效；验证多实例下预算变更传播延迟；验证用户级 `max_parallel_requests=2` 是否对该用户所有 key 生效。
-2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户（含首个周期记录）、余额、月度用量、手动充值（钱包）、周期记录与月底结算任务（含最低月费与开通门槛）、对账停服任务。
+2. **M1 后端核心**：自建认证（登录、会话、邀请/重置密码）、开户（含首个周期记录）、余额、月度用量、手动充值（钱包）、周期记录与月底结算任务（含最低月费与开通门槛）、月底前提醒任务与邮件发送、系统配置、对账停服任务。
 3. **M2 AIMeter 前端（用户自服务界面）**：概览（余额、预计月底扣费）、用量图、key 管理、充值记录、月度账单。
-4. **M3 加固**：低余额/下月不足最低月费提醒、审计、监控告警、限流。
+4. **M3 加固**：低余额阈值通知、审计、监控告警、限流。
 5. **M4 支付接入**：Stripe 等，回调幂等。
 
 ## 11. 待决策
@@ -350,11 +384,11 @@ export LITELLM_MASTER_KEY="sk-your-strong-secret"
 - 技术栈（建议：后端 FastAPI + PostgreSQL，前端 React/Vue 任选；尚未确认）。
 - ~~用户认证方式~~：已决定自建邮箱密码（见 4.7）。仍待定：是否开放自助注册（含邮箱验证）；SMTP/邮件发送服务选型；后续是否追加 OIDC 登录。
 - 余额单位（美元计价 vs 自定义"点数"；LiteLLM 内部以 USD 记账，点数需在 AIMeter 层换算）。
-- ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2，`safety_reserve = 2 × 单个请求最坏成本`（见 4.4）；仍待定：开放的模型与 `max_tokens` 上限（据此算出 `safety_reserve` 具体金额）；`rpm_limit`/`tpm_limit` 默认值。
-- 最低月费：全局默认金额；是否按用户分档/单独配置（已支持 `users.min_fee` 覆盖）。
-- 周期统一结算时区（建议无夏令时的固定偏移，如 Asia/Shanghai 或 UTC）。
+- ~~是否允许小额透支~~：已决定**不允许**（钱包不记负数、不向用户追欠款）；因 LiteLLM 事后记账无法绝对杜绝，残余超支由平台承担（见 4.4）。已决定每用户并发限制为 2；开放模型以 LiteLLM 为准，`safety_reserve` 由 LiteLLM 模型元数据自动计算（见 4.4、4.9）；仍待定：`max_tokens_cap`；`rpm_limit`/`tpm_limit` 默认值。
+- ~~结算时区~~：已决定放在系统配置 `billing_timezone`（见 4.9），具体取值待配置，建议无夏令时的时区。
+- ~~月底前提醒~~：已决定要提醒，余额不足最低月费的用户下个月停服（见 4.8）。仍待定：邮件发送服务选型（与注册邮件共用）；提醒时间点默认 `[7, 1]` 是否合适。
+- 最低月费：全局默认金额 `default_min_fee`（已支持 `users.min_fee` 单独覆盖）。
 - 用户月中开通：当月最低月费默认**按整月收取**，是否改为按剩余天数折算。
-- 月底前是否提醒"余额不足下月最低月费"（建议在 M3 加入）。
 
 ## 12. 评审待办（尚未处理）
 
